@@ -8,9 +8,13 @@
 
 #include "dbs.h"
 
+#define DIV_ROUND_UP(N, S) (((N) + (S) - 1) / (S))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
 // Internal structures, sizes
+
+#define DBS_MAX_VOLUMES 256         // Named volumes
+#define DBS_MAX_SNAPSHOTS 65536     // Total snapshots
 
 #define DBS_VOLUME_NAME_SIZE 256
 #define DBS_EXTENT_SIZE 131072      // 128 KB
@@ -19,16 +23,31 @@
 #define DBS_BLOCK_MASK_IN_EXTENT 0xFF
 #define DBS_EXTENT_BITMAP_SIZE 8    // Each bitmap is 32 bits
 
+const uint8_t dbs_magic[] = {0x44, 0x42, 0x53, 0x40, 0x33, 0x39, 0x0d, 0x21};
+const uint32_t dbs_version = 0x00010000; // 16-bit major, 8-bit minor, 8-bit patch
+
+typedef struct {
+    char magic[8];
+    uint32_t version;
+    uint32_t allocated_extents;
+    uint64_t disk_size;
+} __attribute__((packed)) dbs_superblock;
+
 typedef struct {
     uint16_t snapshot_id;           // Index in snapshots table + 1
     uint64_t volume_size;
     char volume_name[DBS_VOLUME_NAME_SIZE];
-} dbs_volume_metadata;
+} __attribute__((packed)) dbs_volume_metadata;
 
 typedef struct {
     uint16_t parent_snapshot_id;
     time_t created_at;
-} dbs_snapshot_metadata;
+} __attribute__((packed)) dbs_snapshot_metadata;
+
+typedef struct {
+    dbs_volume_metadata volumes[DBS_MAX_VOLUMES];
+    dbs_snapshot_metadata snapshots[DBS_MAX_SNAPSHOTS];
+} dbs_disk_metadata;
 
 typedef struct {
     uint16_t snapshot_id;
@@ -36,29 +55,14 @@ typedef struct {
     uint32_t block_bitmap[DBS_EXTENT_BITMAP_SIZE];
 } dbs_extent_metadata;
 
-const uint8_t dbs_magic[] = {0x44, 0x42, 0x53, 0x40, 0x33, 0x39, 0x0d, 0x21};
-const uint16_t dbs_version = 0x0001;
-
-#define DBS_MAX_VOLUMES 256         // Named volumes
-#define DBS_MAX_SNAPSHOTS 65536     // Total snapshots
-
-typedef struct {
-    char magic[8];
-    uint16_t version;
-    uint64_t disk_size;
-    uint32_t allocated_extents;
-    dbs_volume_metadata volumes[DBS_MAX_VOLUMES];
-    dbs_snapshot_metadata snapshots[DBS_MAX_SNAPSHOTS];
-} dbs_superblock;
-
 // Private variables and parameters
 
 typedef struct {
     int fd;
     uint32_t extent_offset;
     uint32_t data_offset;
-    dbs_superblock *superblock;
-    dbs_volume_metadata *volume;
+    dbs_superblock superblock;
+    dbs_volume_metadata volume;
     dbs_extent_metadata *extents;
 } dbs_volume_info;
 
@@ -79,10 +83,8 @@ void bitmap_unset_bit(uint32_t *bitmap, uint32_t pos) {
 }
 
 uint8_t bitmap_is_empty(uint32_t *bitmap, uint32_t size) {
-    uint32_t sum = 0;
     for (int i = 0; i < size; i++) {
-        sum |= bitmap[sum];
-        if (sum)
+        if (bitmap[i])
             return 0;
     }
     return 1;
@@ -90,100 +92,121 @@ uint8_t bitmap_is_empty(uint32_t *bitmap, uint32_t size) {
 
 // Metadata helpers
 
-uint32_t create_snapshot(dbs_superblock *superblock, uint16_t parent_snapshot_id) {
+uint32_t create_snapshot(dbs_disk_metadata *disk_metadata, uint16_t parent_snapshot_id) {
     uint32_t snapshot_idx;
 
-    for (snapshot_idx = 0; snapshot_idx < DBS_MAX_SNAPSHOTS || superblock->snapshots[snapshot_idx].created_at != 0; snapshot_idx++);
+    for (snapshot_idx = 0; snapshot_idx < DBS_MAX_SNAPSHOTS || disk_metadata->snapshots[snapshot_idx].created_at != 0; snapshot_idx++);
     if (snapshot_idx == DBS_MAX_SNAPSHOTS)
         return 0;
 
-    superblock->snapshots[snapshot_idx].parent_snapshot_id = parent_snapshot_id;
-    superblock->snapshots[snapshot_idx].created_at = time(NULL);
+    disk_metadata->snapshots[snapshot_idx].parent_snapshot_id = parent_snapshot_id;
+    disk_metadata->snapshots[snapshot_idx].created_at = time(NULL);
 
     return snapshot_idx + 1;
+}
+
+uint8_t write_superblock(dbs_volume_info *volume_info) {
+    if (pwrite(volume_info->fd, &(volume_info->superblock), sizeof(dbs_superblock), 0) != sizeof(dbs_superblock))
+        return 0;
+
+    return 1;
+}
+
+uint8_t write_extent_metadata(dbs_volume_info *volume_info, uint32_t extent_idx) {
+    dbs_extent_metadata extent_metadata;
+
+    uint64_t extent_data_offset = volume_info->extent_offset + (volume_info->extents[extent_idx].extent_pos * sizeof(dbs_extent_metadata));
+    memcpy(&extent_metadata, &(volume_info->extents[extent_idx]), sizeof(dbs_extent_metadata));
+    extent_metadata.extent_pos = extent_idx;
+    if (pwrite(volume_info->fd, &extent_metadata, sizeof(dbs_extent_metadata), extent_data_offset) != sizeof(dbs_extent_metadata))
+        return 0;
+
+    return 1;
 }
 
 // API
 
 dbs_context dbs_open(char *device, char *volume_name, uint64_t volume_size) {
-    // Open device and read super block
+    // Open device and read superblock
     int fd = open(device, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
     if (fd < 0) {
         printf("ERROR: Cannot open %s: %s\n", device, strerror(errno));
         return NULL;
     }
 
-    dbs_superblock *superblock = (dbs_superblock *)malloc(sizeof(dbs_superblock));
-    if (!superblock) {
-        printf("ERROR: Cannot allocate context\n");
-        return NULL;
-    }
-    if (pread(fd, superblock, sizeof(dbs_superblock), 0) != sizeof(dbs_superblock)) {
+    dbs_superblock superblock;
+    if (pread(fd, &superblock, sizeof(dbs_superblock), 0) != sizeof(dbs_superblock)) {
         printf("ERROR: Cannot read superblock from device: %s\n", strerror(errno));
-        goto context_failed;
+        return NULL;
     }
 
     // Check magic
-    if (memcmp((uint8_t *)superblock, dbs_magic, 8) != 0) {
+    if (memcmp((uint8_t *)&superblock, dbs_magic, 8) != 0) {
         printf("ERROR: Device not formatted\n");
-        goto context_failed;
+        return NULL;
     }
-    if (superblock->version != dbs_version) {
+    if (superblock.version != dbs_version) {
         printf("ERROR: Metadata version mismatch\n");
-        goto context_failed;
+        return NULL;
     }
 
     // Get or create volume metadata
+    dbs_disk_metadata disk_metadata;
+    if (pread(fd, &disk_metadata, sizeof(dbs_disk_metadata), 512) != sizeof(dbs_disk_metadata)) {
+        printf("ERROR: Cannot read metadata from device: %s\n", strerror(errno));
+        return NULL;
+    }
+
     uint8_t created = 0;
     uint16_t volume_idx;
-    for (volume_idx = 0; volume_idx < DBS_MAX_VOLUMES || superblock->volumes[volume_idx].snapshot_id != 0; volume_idx++) {
-        if (strncmp(volume_name, superblock->volumes[volume_idx].volume_name, DBS_VOLUME_NAME_SIZE - 1) == 0)
+    for (volume_idx = 0; volume_idx < DBS_MAX_VOLUMES || disk_metadata.volumes[volume_idx].snapshot_id != 0; volume_idx++) {
+        if (strncmp(volume_name, disk_metadata.volumes[volume_idx].volume_name, DBS_VOLUME_NAME_SIZE - 1) == 0)
             break;
     }
     if (volume_idx == DBS_MAX_VOLUMES) {
         printf("ERROR: Max volume count reached\n");
-        goto context_failed;
+        return NULL;
     }
-    if (superblock->volumes[volume_idx].snapshot_id == 0) {
+    if (disk_metadata.volumes[volume_idx].snapshot_id == 0) {
         printf("INFO: Creating volume %s\n", device);
         uint16_t snapshot_id;
-        snapshot_id = create_snapshot(superblock, 0);
+        snapshot_id = create_snapshot(&disk_metadata, 0);
         if (!snapshot_id) {
             printf("ERROR: Max snapshot count reached\n");
-            goto context_failed;
+            return NULL;
         }
-        superblock->volumes[volume_idx].snapshot_id = snapshot_id;
-        superblock->volumes[volume_idx].volume_size = volume_size;
-        strncpy(superblock->volumes[volume_idx].volume_name, volume_name, DBS_VOLUME_NAME_SIZE - 1);
+        disk_metadata.volumes[volume_idx].snapshot_id = snapshot_id;
+        disk_metadata.volumes[volume_idx].volume_size = volume_size;
+        strncpy(disk_metadata.volumes[volume_idx].volume_name, volume_name, DBS_VOLUME_NAME_SIZE - 1);
         created = 1;
     } else {
-        if (superblock->volumes[volume_idx].volume_size != volume_size) {
-            printf("ERROR: Volume size mismatch %llu != %llu\n", superblock->volumes[volume_idx].volume_size, volume_size);
-            goto context_failed;
+        if (disk_metadata.volumes[volume_idx].volume_size != volume_size) {
+            printf("ERROR: Volume size mismatch %llu != %llu\n", disk_metadata.volumes[volume_idx].volume_size, volume_size);
+            return NULL;
         }
     }
 
     // Prepare context
-    uint32_t total_volume_extents = (volume_size / DBS_EXTENT_SIZE) + (volume_size % DBS_EXTENT_SIZE ? 1 : 0);
     dbs_volume_info *volume_info = (dbs_volume_info *)malloc(sizeof(dbs_volume_info));
     if (!volume_info) {
         printf("ERROR: Cannot allocate context\n");
-        goto context_failed;
+        return NULL;
     }
+    uint32_t total_volume_extents = (volume_size / DBS_EXTENT_SIZE) + (volume_size % DBS_EXTENT_SIZE ? 1 : 0);
     dbs_extent_metadata *extents = (dbs_extent_metadata *)malloc(sizeof(dbs_extent_metadata) * total_volume_extents);
     if (!extents) {
         printf("ERROR: Cannot allocate context\n");
         free(volume_info);
-        goto context_failed;
+        return NULL;
     }
     volume_info->fd = fd;
-    volume_info->extent_offset = sizeof(superblock);
-    uint32_t total_disk_extents = superblock->disk_size / DBS_EXTENT_SIZE;
-    uint32_t metadata_size = sizeof(superblock) + (sizeof(dbs_extent_metadata) * total_disk_extents);
-    uint32_t data_offset = ((metadata_size / DBS_EXTENT_SIZE) + (metadata_size % DBS_EXTENT_SIZE ? 1 : 0)) * DBS_EXTENT_SIZE;
+    volume_info->extent_offset = (1 + DIV_ROUND_UP(sizeof(dbs_disk_metadata), 512)) * 512;
+    uint32_t total_disk_extents = (superblock.disk_size - volume_info->extent_offset) / DBS_EXTENT_SIZE;
+    uint32_t metadata_size = volume_info->extent_offset + (sizeof(dbs_extent_metadata) * total_disk_extents);
+    uint32_t data_offset = DIV_ROUND_UP(sizeof(dbs_disk_metadata), DBS_EXTENT_SIZE) * DBS_EXTENT_SIZE;
     volume_info->data_offset = data_offset;
-    volume_info->superblock = superblock;
-    volume_info->volume = &(superblock->volumes[volume_idx]);
+    memcpy(&(volume_info->superblock), &superblock, sizeof(dbs_superblock));
+    memcpy(&(volume_info->volume), &(disk_metadata.volumes[volume_idx]), sizeof(dbs_volume_metadata));
     volume_info->extents = extents;
     memset(extents, 0, sizeof(dbs_extent_metadata) * total_volume_extents);
 
@@ -197,10 +220,10 @@ dbs_context dbs_open(char *device, char *volume_name, uint64_t volume_size) {
         goto populate_extents_failed;
     }
 
-    uint16_t current_snapshot_id = volume_info->volume->snapshot_id;
+    uint16_t current_snapshot_id = volume_info->volume.snapshot_id;
     do {
         // Scan all extent metadata for the current snapshot id and place them in the extent map
-        uint64_t extents_remaining = MIN(total_disk_extents, superblock->allocated_extents);
+        uint64_t extents_remaining = MIN(total_disk_extents, superblock.allocated_extents);
         uint32_t batch_extent_start = 0;
         while (extents_remaining) {
             uint32_t batch_size = MIN(DBS_EXTENT_LOAD_BATCH, extents_remaining);
@@ -223,18 +246,13 @@ dbs_context dbs_open(char *device, char *volume_name, uint64_t volume_size) {
         };
 
         // Move on to the parent volume
-        current_snapshot_id = superblock->snapshots[current_snapshot_id - 1].parent_snapshot_id;
+        current_snapshot_id = disk_metadata.snapshots[current_snapshot_id - 1].parent_snapshot_id;
     } while (current_snapshot_id);
 
     return (dbs_context)volume_info;
 
-context_failed:
-    free(superblock);
-    return NULL;
-
 populate_extents_failed:
     free(volume_info->extents);
-    free(volume_info->superblock);
     free(volume_info);
     return NULL;
 }
@@ -250,7 +268,7 @@ void dbs_close(dbs_context volume) {
 uint8_t dbs_read(dbs_context volume, uint64_t block, void *data) {
     dbs_volume_info *volume_info = (dbs_volume_info *)volume;
 
-    uint32_t total_volume_extents = (volume_info->volume->volume_size / DBS_EXTENT_SIZE) + (volume_info->volume->volume_size % DBS_EXTENT_SIZE ? 1 : 0);
+    uint32_t total_volume_extents = (volume_info->volume.volume_size / DBS_EXTENT_SIZE) + (volume_info->volume.volume_size % DBS_EXTENT_SIZE ? 1 : 0);
     uint32_t extent_idx = block >> DBS_BLOCK_BITS_IN_EXTENT;
     if (extent_idx > total_volume_extents) {
         return 1;
@@ -274,7 +292,7 @@ uint8_t dbs_read(dbs_context volume, uint64_t block, void *data) {
 uint8_t dbs_write(dbs_context volume, uint64_t block, void *data) {
     dbs_volume_info *volume_info = (dbs_volume_info *)volume;
 
-    uint32_t total_volume_extents = (volume_info->volume->volume_size / DBS_EXTENT_SIZE) + (volume_info->volume->volume_size % DBS_EXTENT_SIZE ? 1 : 0);
+    uint32_t total_volume_extents = (volume_info->volume.volume_size / DBS_EXTENT_SIZE) + (volume_info->volume.volume_size % DBS_EXTENT_SIZE ? 1 : 0);
     uint32_t extent_idx = block >> DBS_BLOCK_BITS_IN_EXTENT;
     if (extent_idx > total_volume_extents) {
         return 1;
@@ -282,9 +300,21 @@ uint8_t dbs_write(dbs_context volume, uint64_t block, void *data) {
 
     // Unallocated or previous snapshot extent
     dbs_extent_metadata *extent_metadata = &(volume_info->extents[extent_idx]);
-    if (extent_metadata->snapshot_id == 0 || extent_metadata->snapshot_id != volume_info->volume->snapshot_id) {
-        // XXX Allocate new extent
-        return -1;
+    if (extent_metadata->snapshot_id == 0 || extent_metadata->snapshot_id != volume_info->volume.snapshot_id) {
+        // Allocate new extent
+        extent_metadata->snapshot_id = volume_info->volume.snapshot_id;
+        extent_metadata->extent_pos = volume_info->superblock.allocated_extents;
+        if (!write_extent_metadata(volume_info, extent_idx)) {
+            printf("ERROR: Failed writing metadata to device for block %llu: %s\n", block, strerror(errno));
+            return -1;
+        }
+
+        // Update allocation count
+        volume_info->superblock.allocated_extents++;
+        if (!write_superblock(volume_info)) {
+            printf("ERROR: Failed writing metadata to device for block %llu: %s\n", block, strerror(errno));
+            return -1;
+        }
     }
 
     // Write data to device
@@ -299,8 +329,7 @@ uint8_t dbs_write(dbs_context volume, uint64_t block, void *data) {
         return 0;
 
     bitmap_set_bit(extent_metadata->block_bitmap, block & DBS_BLOCK_MASK_IN_EXTENT);
-    uint64_t extent_data_offset = volume_info->extent_offset + (extent_metadata->extent_pos * sizeof(dbs_extent_metadata));
-    if (pwrite(volume_info->fd, extent_metadata, sizeof(dbs_extent_metadata), extent_data_offset) != sizeof(dbs_extent_metadata)) {
+    if (!write_extent_metadata(volume_info, extent_idx)) {
         printf("ERROR: Failed writing metadata to device for block %llu: %s\n", block, strerror(errno));
         return -1;
     }
@@ -311,7 +340,7 @@ uint8_t dbs_write(dbs_context volume, uint64_t block, void *data) {
 uint8_t dbs_unmap(dbs_context volume, uint64_t block) {
     dbs_volume_info *volume_info = (dbs_volume_info *)volume;
 
-    uint32_t total_volume_extents = (volume_info->volume->volume_size / DBS_EXTENT_SIZE) + (volume_info->volume->volume_size % DBS_EXTENT_SIZE ? 1 : 0);
+    uint32_t total_volume_extents = (volume_info->volume.volume_size / DBS_EXTENT_SIZE) + (volume_info->volume.volume_size % DBS_EXTENT_SIZE ? 1 : 0);
     uint32_t extent_idx = block >> DBS_BLOCK_BITS_IN_EXTENT;
     if (extent_idx > total_volume_extents) {
         return 1;
@@ -325,12 +354,11 @@ uint8_t dbs_unmap(dbs_context volume, uint64_t block) {
 
     // Update metadata
     bitmap_unset_bit(extent_metadata->block_bitmap, block & DBS_BLOCK_MASK_IN_EXTENT);
-    uint64_t extent_data_offset = volume_info->extent_offset + (extent_metadata->extent_pos * sizeof(dbs_extent_metadata));
     if (bitmap_is_empty(extent_metadata->block_bitmap, DBS_EXTENT_BITMAP_SIZE) == 0) {
         // Release if not used
-        memset(extent_metadata, 0, sizeof(dbs_extent_metadata));
+        extent_metadata->snapshot_id = 0;
     }
-    if (pwrite(volume_info->fd, extent_metadata, sizeof(dbs_extent_metadata), extent_data_offset) != sizeof(dbs_extent_metadata)) {
+    if (!write_extent_metadata(volume_info, extent_idx)) {
         printf("ERROR: Failed writing metadata to device for block %llu: %s\n", block, strerror(errno));
         return -1;
     }
