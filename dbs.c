@@ -206,6 +206,8 @@ dbs_bool dbs_init_device(char *device) {
     }
     if (pwrite(device_info.fd, &(device_info.superblock), sizeof(dbs_superblock), 0) != sizeof(dbs_superblock))
         goto fail_with_device_info;
+
+    close(device_info.fd);
     return DBS_SUCCESS;
 
 fail_with_device_info:
@@ -218,11 +220,61 @@ void dbs_vacuum_device(char *device) {
 }
 
 void dbs_list_volumes(char *device) {
-    printf("ERROR: Not implemented\n");
+    dbs_device_info device_info;
+    dbs_volume_metadata *volumes = device_info.device_metadata.volumes;
+    dbs_snapshot_metadata *snapshots = device_info.device_metadata.snapshots;
+    if (!get_device_info(device, &device_info, 1))
+        goto fail_with_device_info;
+
+    char format_string[] = "%6s | %6s | %10s | %20s | %s\n";
+    char size_string[20];
+    char created_at_string[20];
+    printf(format_string, "ID", "Snap.", "Size", "Created at", "Name");
+    printf(format_string, "------", "------", "----------", "--------------------", "----------------------------------------");
+    uint16_t volume_idx;
+    for (volume_idx = 0; volume_idx < DBS_MAX_VOLUMES || volumes[volume_idx].snapshot_id != 0; volume_idx++) {
+        sprintf(size_string, "%.02lf GB", (double)volumes[volume_idx].volume_size / (1024.0 * 1024.0 * 1024.0));
+        uint16_t snapshot_idx = volumes[volume_idx].snapshot_id - 1;
+        strftime(created_at_string, 20, "%Y-%m-%d %H:%M:%S", localtime(&(snapshots[snapshot_idx].created_at)));
+        uint16_t snapshot_count;
+        for (snapshot_count = 1; snapshots[snapshot_idx].parent_snapshot_id != 0; snapshot_count++)
+            snapshot_idx = snapshots[snapshot_idx].parent_snapshot_id - 1;
+        printf(format_string, volumes[volume_idx].snapshot_id, snapshot_count, size_string, created_at_string, volumes[volume_idx].volume_name);
+    }
+
+fail_with_device_info:
+    close(device_info.fd);
 }
 
 void dbs_list_snapshots(char *device, char *volume_name) {
-    printf("ERROR: Not implemented\n");
+    dbs_device_info device_info;
+    dbs_volume_metadata *volumes = device_info.device_metadata.volumes;
+    dbs_snapshot_metadata *snapshots = device_info.device_metadata.snapshots;
+    if (!get_device_info(device, &device_info, 1))
+        goto fail_with_device_info;
+
+    char format_string[] = "%6s | %20s\n";
+    char created_at_string[20];
+    printf(format_string, "ID", "Created at");
+    printf(format_string, "------", "--------------------");
+    uint16_t volume_idx;
+    for (volume_idx = 0; volume_idx < DBS_MAX_VOLUMES || volumes[volume_idx].snapshot_id != 0; volume_idx++) {
+        if (strncmp(volume_name, volumes[volume_idx].volume_name, DBS_VOLUME_NAME_SIZE - 1) == 0)
+            break;
+    }
+    if (volume_idx == DBS_MAX_VOLUMES) {
+        printf("ERROR: Volume not found\n");
+        goto fail_with_device_info;
+    }
+    uint16_t snapshot_idx = volumes[volume_idx].snapshot_id - 1;
+    do {
+        strftime(created_at_string, 20, "%Y-%m-%d %H:%M:%S", localtime(&(snapshots[snapshot_idx].created_at)));
+        printf(format_string, volumes[volume_idx].snapshot_id, created_at_string);
+        snapshot_idx = snapshots[snapshot_idx].parent_snapshot_id - 1;
+    } while (snapshot_idx >= 0);
+
+fail_with_device_info:
+    close(device_info.fd);
 }
 
 dbs_bool dbs_create_volume(char *device, char *volume_name, uint64_t volume_size) {
@@ -247,7 +299,6 @@ dbs_bool dbs_create_volume(char *device, char *volume_name, uint64_t volume_size
     }
 
     // Create volume
-    printf("INFO: Creating volume %s\n", device);
     uint16_t snapshot_id = add_snapshot(&(device_info.device_metadata), 0);
     if (!snapshot_id) {
         printf("ERROR: Max snapshot count reached\n");
@@ -259,6 +310,8 @@ dbs_bool dbs_create_volume(char *device, char *volume_name, uint64_t volume_size
 
     if (pwrite(device_info.fd, &(device_info.device_metadata), sizeof(dbs_device_metadata), 512) != sizeof(dbs_device_metadata))
         goto fail_with_device_info;
+
+    close(device_info.fd);
     return DBS_SUCCESS;
 
 fail_with_device_info:
@@ -267,7 +320,39 @@ fail_with_device_info:
 }
 
 void dbs_snapshot_volume(char *device, char *volume_name) {
-    printf("ERROR: Not implemented\n");
+    dbs_device_info device_info;
+    dbs_volume_metadata *volumes = device_info.device_metadata.volumes;
+    if (!get_device_info(device, &device_info, 1))
+        goto fail_with_device_info;
+
+    // Find volume
+    uint16_t volume_idx;
+    for (volume_idx = 0; volume_idx < DBS_MAX_VOLUMES || volumes[volume_idx].snapshot_id != 0; volume_idx++) {
+        if (strncmp(volume_name, volumes[volume_idx].volume_name, DBS_VOLUME_NAME_SIZE - 1) == 0)
+            break;
+    }
+    if (volume_idx == DBS_MAX_VOLUMES || volumes[volume_idx].snapshot_id == 0) {
+        printf("ERROR: Volume not found\n");
+        goto fail_with_device_info;
+    }
+
+    // Create snapshot
+    uint16_t snapshot_id = add_snapshot(&(device_info.device_metadata), volumes[volume_idx].snapshot_id);
+    if (!snapshot_id) {
+        printf("ERROR: Max snapshot count reached\n");
+        goto fail_with_device_info;
+    }
+    volumes[volume_idx].snapshot_id = snapshot_id;
+
+    if (pwrite(device_info.fd, &(device_info.device_metadata), sizeof(dbs_device_metadata), 512) != sizeof(dbs_device_metadata))
+        goto fail_with_device_info;
+
+    close(device_info.fd);
+    return DBS_SUCCESS;
+
+fail_with_device_info:
+    close(device_info.fd);
+    return DBS_FAILURE;
 }
 
 void dbs_delete_volume(char *device, char *volume_name) {
@@ -293,7 +378,7 @@ dbs_context dbs_open(char *device, char *volume_name) {
         if (strncmp(volume_name, volumes[volume_idx].volume_name, DBS_VOLUME_NAME_SIZE - 1) == 0)
             break;
     }
-    if (volume_idx == DBS_MAX_VOLUMES) {
+    if (volume_idx == DBS_MAX_VOLUMES || volumes[volume_idx].snapshot_id == 0) {
         printf("ERROR: Volume not found\n");
         goto fail_with_device_info;
     }
