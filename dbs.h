@@ -15,20 +15,21 @@ void dbs_list_volumes(char *device);
 void dbs_list_snapshots(char *device, char *volume_name);
 
 dbs_bool dbs_create_volume(char *device, char *volume_name, uint64_t volume_size);
-void dbs_snapshot_volume(char *device, char *volume_name);
-void dbs_delete_volume(char *device, char *volume_name);
+dbs_bool dbs_create_snapshot(char *device, char *volume_name);
+dbs_bool dbs_clone_snapshot(char *device, char *volume_name, uint16_t snapshot_id);
 
-void dbs_clone_snapshot(char *device, char *volume_name, uint16_t snapshot_id);
+dbs_bool dbs_delete_volume(char *device, char *volume_name);
+dbs_bool dbs_delete_snapshot(char *device, uint16_t snapshot_id);
 
 // Block API
 
-typedef void* dbs_context;
+typedef void *dbs_context;
 
 dbs_context dbs_open(char *device, char *volume_name);
-void dbs_close(dbs_context volume);
+void dbs_close(dbs_context context);
 
-dbs_bool dbs_read(dbs_context volume, uint64_t block, void *data);
-dbs_bool dbs_write(dbs_context volume, uint64_t block, void *data);
-dbs_bool dbs_unmap(dbs_context volume, uint64_t block);
+dbs_bool dbs_read(dbs_context context, uint64_t block, void *data);
+dbs_bool dbs_write(dbs_context context, uint64_t block, void *data);
+dbs_bool dbs_unmap(dbs_context context, uint64_t block);
 
 #endif
