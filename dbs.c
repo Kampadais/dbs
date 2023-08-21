@@ -160,7 +160,6 @@ dbs_bool fill_metadata_context(dbs_metadata_context *metadata_context, char *dev
         printf("ERROR: Cannot read metadata: %s\n", strerror(errno));
         return DBS_FAILURE;
     }
-
     return DBS_SUCCESS;
 }
 
@@ -170,6 +169,31 @@ uint16_t find_volume_name(dbs_volume_metadata *volumes, char *volume_name) {
             return volume_idx;
     }
     return 0;
+}
+
+uint16_t find_child_snapshot_id(dbs_snapshot_metadata *snapshots, uint16_t snapshot_id) {
+    uint32_t snapshot_idx;
+    for (snapshot_idx = 0; snapshot_idx < DBS_MAX_SNAPSHOTS || snapshots[snapshot_idx].created_at != 0; snapshot_idx++) {
+        if (snapshots[snapshot_idx].parent_snapshot_id == snapshot_id)
+            return snapshot_idx + 1;
+    }
+    return 0;
+}
+
+uint16_t find_snapshot_id(dbs_device_metadata *device_metadata, uint16_t snapshot_id) {
+    do {
+        // Search for snapshot id in volumes
+        for (uint16_t volume_idx = 0; volume_idx < DBS_MAX_VOLUMES || device_metadata->volumes[volume_idx].snapshot_id != 0; volume_idx++) {
+            if (device_metadata->volumes[volume_idx].snapshot_id == snapshot_id)
+                return volume_idx;
+        }
+
+        // Try with child snapshot id
+        uint16_t child_snapshot_id = find_child_snapshot_id(device_metadata->snapshots, snapshot_id);
+        if (!child_snapshot_id)
+            return 0;
+        snapshot_id = child_snapshot_id;
+    } while(1);
 }
 
 uint32_t add_snapshot(dbs_device_metadata *device_metadata, uint16_t parent_snapshot_id) {
@@ -182,12 +206,41 @@ uint32_t add_snapshot(dbs_device_metadata *device_metadata, uint16_t parent_snap
     return snapshot_idx + 1;
 }
 
-dbs_extent_map *get_extent_map(dbs_device_context *device_context, uint64_t volume_size, uint16_t snapshot_id) {
+dbs_bool write_superblock(dbs_device_context *device_context) {
+    if (pwrite(device_context->fd, &(device_context->superblock), sizeof(dbs_superblock), 0) != sizeof(dbs_superblock))
+        return DBS_FAILURE;
+    return DBS_SUCCESS;
+}
+
+dbs_bool write_device_metadata(dbs_device_context *device_context, dbs_device_metadata *device_metadata) {
+    if (pwrite(device_context->fd, device_metadata, sizeof(dbs_device_metadata), 512) != sizeof(dbs_device_metadata))
+        return DBS_FAILURE;
+    return DBS_SUCCESS;
+}
+
+dbs_bool write_extent_metadata(dbs_device_context *device_context, dbs_extent_map *extent_map, uint32_t extent_idx) {
+    dbs_extent_metadata extent_metadata;
+    uint64_t extent_data_offset = device_context->extent_offset + (extent_map->extents[extent_idx].extent_pos * sizeof(dbs_extent_metadata));
+    memcpy(&extent_metadata, &(extent_map->extents[extent_idx]), sizeof(dbs_extent_metadata));
+    extent_metadata.extent_pos = extent_idx;
+    if (pwrite(device_context->fd, &extent_metadata, sizeof(dbs_extent_metadata), extent_data_offset) != sizeof(dbs_extent_metadata))
+        return DBS_FAILURE;
+    return DBS_SUCCESS;
+}
+
+void free_extent_map(dbs_extent_map *extent_map) {
+    if (extent_map->extent_bitmap)
+        free(extent_map->extent_bitmap);
+    if (extent_map->extents)
+        free(extent_map->extents);
+    free(extent_map);
+}
+
+dbs_extent_map *get_snapshot_extent_map(dbs_device_context *device_context, uint64_t volume_size, uint16_t snapshot_id) {
     dbs_extent_map *extent_map = (dbs_extent_map *)malloc(sizeof(dbs_extent_map));
-    if (!extent_map) {
+    if (!extent_map)
         return NULL;
-    }
-    uint32_t total_volume_extents = DIV_ROUND_UP(volume_size, DBS_EXTENT_SIZE);
+    uint32_t total_volume_extents = volume_size / DBS_EXTENT_SIZE;
     extent_map->total_volume_extents = total_volume_extents;
     extent_map->allocated_volume_extents = 0;
     extent_map->max_extent_idx = 0;
@@ -234,39 +287,63 @@ dbs_extent_map *get_extent_map(dbs_device_context *device_context, uint64_t volu
     return extent_map;
 
 fail_with_extent_map:
-    if (extent_map->extent_bitmap)
-        free(extent_map->extent_bitmap);
-    if (extent_map->extents)
-        free(extent_map->extents);
-    free(extent_map);
+    free_extent_map(extent_map);
     return NULL;
 }
 
-void free_extent_map(dbs_extent_map *extent_map) {
-    free(extent_map->extent_bitmap);
-    free(extent_map->extents);
-    free(extent_map);
+dbs_extent_map *get_volume_extent_map(dbs_device_context *device_context, uint64_t volume_size, uint16_t snapshot_id, dbs_snapshot_metadata *snapshots) {
+    dbs_extent_map *volume_extent_map = get_snapshot_extent_map(device_context, volume_size, snapshot_id);
+    if (!volume_extent_map)
+        return NULL;
+
+    // Populate with extents from previous snapshots
+    for (uint16_t snapshot_idx = snapshots[snapshot_id - 1].parent_snapshot_id - 1; snapshot_idx >= 0; snapshot_idx = snapshots[snapshot_idx].parent_snapshot_id - 1) {
+        dbs_extent_map *snapshot_extent_map = get_snapshot_extent_map(device_context, volume_size, snapshot_idx + 1);
+        if (!snapshot_extent_map)
+            goto fail_with_extent_map;
+        for (uint32_t extent_idx = 0; extent_idx <= snapshot_extent_map->max_extent_idx; ) {
+            // If the region is empty, skip it completely
+            if (bitmap_region_is_empty(snapshot_extent_map->extent_bitmap, extent_idx)) {
+                extent_idx += 32;
+                continue;
+            }
+            for (int i = 0; i < 32 && extent_idx <= snapshot_extent_map->max_extent_idx; i++, extent_idx++) {
+                if (snapshot_extent_map->extents[extent_idx].snapshot_id == 0 || volume_extent_map->extents[extent_idx].snapshot_id != 0)
+                    continue;
+                memcpy(&(volume_extent_map->extents[extent_idx]), &(snapshot_extent_map->extents[extent_idx]), sizeof(dbs_extent_metadata));
+                volume_extent_map->allocated_volume_extents++;
+                volume_extent_map->max_extent_idx = MAX(volume_extent_map->max_extent_idx, extent_idx);
+                bitmap_set_bit(volume_extent_map->extent_bitmap, extent_idx);
+            }
+        }
+        free_extent_map(snapshot_extent_map);
+    }
+
+    return volume_extent_map;
+
+fail_with_extent_map:
+    free_extent_map(volume_extent_map);
+    return NULL;
 }
 
-dbs_bool write_superblock(dbs_device_context *device_context) {
-    if (pwrite(device_context->fd, &(device_context->superblock), sizeof(dbs_superblock), 0) != sizeof(dbs_superblock))
-        return DBS_FAILURE;
-    return DBS_SUCCESS;
-}
-
-dbs_bool write_device_metadata(dbs_device_context *device_context, dbs_device_metadata *device_metadata) {
-    if (pwrite(device_context->fd, device_metadata, sizeof(dbs_device_metadata), 512) != sizeof(dbs_device_metadata))
-        return DBS_FAILURE;
-    return DBS_SUCCESS;
-}
-
-dbs_bool write_extent_metadata(dbs_device_context *device_context, dbs_extent_map *extent_map, uint32_t extent_idx) {
-    dbs_extent_metadata extent_metadata;
-    uint64_t extent_data_offset = device_context->extent_offset + (extent_map->extents[extent_idx].extent_pos * sizeof(dbs_extent_metadata));
-    memcpy(&extent_metadata, &(extent_map->extents[extent_idx]), sizeof(dbs_extent_metadata));
-    extent_metadata.extent_pos = extent_idx;
-    if (pwrite(device_context->fd, &extent_metadata, sizeof(dbs_extent_metadata), extent_data_offset) != sizeof(dbs_extent_metadata))
-        return DBS_FAILURE;
+dbs_bool delete_extent_map(dbs_device_context *device_context, dbs_extent_map *extent_map) {
+    for (uint32_t extent_idx = 0; extent_idx <= extent_map->max_extent_idx; ) {
+        // If the region is empty, skip it completely
+        if (bitmap_region_is_empty(extent_map->extent_bitmap, extent_idx)) {
+            extent_idx += 32;
+            continue;
+        }
+        for (int i = 0; i < 32 && extent_idx <= extent_map->max_extent_idx; i++, extent_idx++) {
+            if (extent_map->extents[extent_idx].snapshot_id == 0)
+                continue;
+            // Delete extent
+            extent_map->extents[extent_idx].snapshot_id = 0;
+            if (!write_extent_metadata(device_context, extent_map, extent_idx)) {
+                printf("ERROR: Failed writing metadata for extent %u: %s\n", extent_idx, strerror(errno));
+                return DBS_FAILURE;
+            }
+        }
+    }
     return DBS_SUCCESS;
 }
 
@@ -397,8 +474,10 @@ dbs_bool dbs_create_volume(char *device, char *volume_name, uint64_t volume_size
     volumes[volume_idx].snapshot_id = snapshot_id;
     volumes[volume_idx].volume_size = volume_size;
     strncpy(volumes[volume_idx].volume_name, volume_name, DBS_VOLUME_NAME_SIZE - 1);
-    if (!write_device_metadata(&(metadata_context.device_context), &(metadata_context.device_metadata)))
+    if (!write_device_metadata(&(metadata_context.device_context), &(metadata_context.device_metadata))) {
+        printf("ERROR: Failed writing volume metadata\n");
         goto fail_with_device_context;
+    }
 
     close(metadata_context.device_context.fd);
     return DBS_SUCCESS;
@@ -428,8 +507,10 @@ dbs_bool dbs_create_snapshot(char *device, char *volume_name) {
         goto fail_with_device_context;
     }
     volumes[volume_idx].snapshot_id = snapshot_id;
-    if (!write_device_metadata(&(metadata_context.device_context), &(metadata_context.device_metadata)))
+    if (!write_device_metadata(&(metadata_context.device_context), &(metadata_context.device_metadata))) {
+        printf("ERROR: Failed writing volume metadata\n");
         goto fail_with_device_context;
+    }
 
     close(metadata_context.device_context.fd);
     return DBS_SUCCESS;
@@ -440,7 +521,96 @@ fail_with_device_context:
 }
 
 dbs_bool dbs_clone_snapshot(char *device, char *volume_name, uint16_t snapshot_id) {
-    printf("ERROR: Not implemented\n");
+    dbs_metadata_context metadata_context;
+    dbs_volume_metadata *volumes = metadata_context.device_metadata.volumes;
+    dbs_snapshot_metadata *snapshots = metadata_context.device_metadata.snapshots;
+    if (!fill_metadata_context(&metadata_context, device))
+        goto fail_with_device_context;
+
+    // Find volume from snapshot id and load extents
+    uint16_t src_volume_idx = find_snapshot_id(&(metadata_context.device_metadata), snapshot_id);
+    if (!src_volume_idx) {
+        printf("ERROR: Volume not found\n");
+        goto fail_with_device_context;
+    }
+    dbs_extent_map *extent_map = get_volume_extent_map(&(metadata_context.device_context), volumes[src_volume_idx].volume_size, snapshot_id, snapshots);
+    if (!extent_map)
+        goto fail_with_device_context;
+
+    // Create volume
+    uint16_t dest_volume_idx;
+    for (dest_volume_idx = 0; dest_volume_idx < DBS_MAX_VOLUMES || volumes[dest_volume_idx].snapshot_id != 0; dest_volume_idx++);
+    if (dest_volume_idx == DBS_MAX_VOLUMES) {
+        printf("ERROR: Max volume count reached\n");
+        goto fail_with_device_context;
+    }
+    uint16_t dest_snapshot_id = add_snapshot(&(metadata_context.device_metadata), 0);
+    if (!dest_snapshot_id) {
+        printf("ERROR: Max snapshot count reached\n");
+        goto fail_with_device_context;
+    }
+    volumes[dest_volume_idx].snapshot_id = dest_snapshot_id;
+    volumes[dest_volume_idx].volume_size = volumes[src_volume_idx].volume_size;
+    strncpy(volumes[dest_volume_idx].volume_name, volume_name, DBS_VOLUME_NAME_SIZE - 1);
+    if (!write_device_metadata(&(metadata_context.device_context), &(metadata_context.device_metadata))) {
+        printf("ERROR: Failed writing volume metadata\n");
+        goto fail_with_device_context;
+    }
+
+    // Copy extents
+    if (metadata_context.device_context.superblock.allocated_device_extents + extent_map->allocated_volume_extents > metadata_context.device_context.total_device_extents) {
+        printf("ERROR: No space left on device\n");
+        goto fail_with_device_context;
+    }
+    for (uint32_t extent_idx = 0; extent_idx <= extent_map->max_extent_idx; ) {
+        // If the region is empty, skip it completely
+        if (bitmap_region_is_empty(extent_map->extent_bitmap, extent_idx)) {
+            extent_idx += 32;
+            continue;
+        }
+        for (int i = 0; i < 32 && extent_idx <= extent_map->max_extent_idx; i++, extent_idx++) {
+            if (extent_map->extents[extent_idx].snapshot_id != 0)
+                continue;
+
+            dbs_extent_metadata *extent_metadata = &(extent_map->extents[extent_idx]);
+
+            // Copy data
+            char *data[DBS_EXTENT_SIZE];
+            uint64_t src_extent_data_offset = metadata_context.device_context.data_offset + (extent_metadata->extent_pos * DBS_EXTENT_SIZE);
+            if (pread(metadata_context.device_context.fd, data, DBS_EXTENT_SIZE, src_extent_data_offset) != DBS_EXTENT_SIZE) {
+                printf("ERROR: Failed reading extent %u: %s\n", extent_idx, strerror(errno));
+                goto fail_with_device_context;
+            }
+            uint32_t next_extent_device_pos = metadata_context.device_context.superblock.allocated_device_extents;
+            uint64_t dest_extent_data_offset = metadata_context.device_context.data_offset + (next_extent_device_pos * DBS_EXTENT_SIZE);
+            if (pwrite(metadata_context.device_context.fd, data, DBS_EXTENT_SIZE, dest_extent_data_offset) != DBS_EXTENT_SIZE) {
+                printf("ERROR: Failed writing extent %u: %s\n", extent_idx, strerror(errno));
+                goto fail_with_device_context;
+            }
+            metadata_context.device_context.superblock.allocated_device_extents++;
+
+            // Write metadata
+            extent_metadata->snapshot_id = dest_snapshot_id;
+            extent_metadata->extent_pos = next_extent_device_pos;
+            if (!write_extent_metadata(&(metadata_context.device_context), extent_map, extent_idx)) {
+                printf("ERROR: Failed writing metadata for extent %u: %s\n", extent_idx, strerror(errno));
+                goto fail_with_device_context;
+            }
+        }
+    }
+
+    // Update allocation count
+    if (!write_superblock(&(metadata_context.device_context))) {
+        printf("ERROR: Failed writing superblock: %s\n", strerror(errno));
+        goto fail_with_device_context;
+    }
+    free_extent_map(extent_map);
+
+    close(metadata_context.device_context.fd);
+    return DBS_SUCCESS;
+
+fail_with_device_context:
+    close(metadata_context.device_context.fd);
     return DBS_FAILURE;
 }
 
@@ -457,36 +627,19 @@ dbs_bool dbs_delete_volume(char *device, char *volume_name) {
         goto fail_with_device_context;
     }
     for (uint16_t snapshot_idx = volumes[volume_idx].snapshot_id - 1; snapshot_idx >= 0; snapshot_idx = snapshots[snapshot_idx].parent_snapshot_id - 1) {
-        dbs_extent_map *extent_map = get_extent_map(&(metadata_context.device_context), volumes[volume_idx].volume_size, snapshot_idx + 1);
-        if (!extent_map) {
+        dbs_extent_map *extent_map = get_snapshot_extent_map(&(metadata_context.device_context), volumes[volume_idx].volume_size, snapshot_idx + 1);
+        if (!extent_map)
             goto fail_with_device_context;
-        }
-        for (uint32_t extent_idx = 0; extent_idx <= extent_map->max_extent_idx; ) {
-            // If the region is empty, skip it completely
-            if (bitmap_region_is_empty(extent_map->extent_bitmap, extent_idx)) {
-                extent_idx += 32;
-                continue;
-            }
-            for (int i = 0; i < 32; i++) {
-                if (extent_map->extents[extent_idx].snapshot_id == 0)
-                    continue;
-
-                // Delete extent
-                extent_map->extents[extent_idx].snapshot_id = 0;
-                if (!write_extent_metadata(&(metadata_context.device_context), extent_map, extent_idx)) {
-                    printf("ERROR: Failed writing metadata for extent %u: %s\n", extent_idx, strerror(errno));
-                    free_extent_map(extent_map);
-                    goto fail_with_device_context;
-                }
-                extent_idx++;
-            }
-        }
+        if (!delete_extent_map(&(metadata_context.device_context), extent_map))
+            goto fail_with_device_context;
         free_extent_map(extent_map);
         snapshots[snapshot_idx].created_at = 0;
     }
     volumes[volume_idx].snapshot_id = 0;
-    if (!write_device_metadata(&(metadata_context.device_context), &(metadata_context.device_metadata)))
+    if (!write_device_metadata(&(metadata_context.device_context), &(metadata_context.device_metadata))) {
+        printf("ERROR: Failed writing volume metadata\n");
         goto fail_with_device_context;
+    }
 
     close(metadata_context.device_context.fd);
     return DBS_SUCCESS;
@@ -497,7 +650,76 @@ fail_with_device_context:
 }
 
 dbs_bool dbs_delete_snapshot(char *device, uint16_t snapshot_id) {
-    printf("ERROR: Not implemented\n");
+    dbs_metadata_context metadata_context;
+    dbs_volume_metadata *volumes = metadata_context.device_metadata.volumes;
+    dbs_snapshot_metadata *snapshots = metadata_context.device_metadata.snapshots;
+    if (!fill_metadata_context(&metadata_context, device))
+        goto fail_with_device_context;
+
+    // Find volume from snapshot id and load extents
+    uint16_t volume_idx = find_snapshot_id(&(metadata_context.device_metadata), snapshot_id);
+    if (!volume_idx) {
+        printf("ERROR: Volume not found\n");
+        goto fail_with_device_context;
+    }
+    if (volumes[volume_idx].snapshot_id == snapshot_id) {
+        printf("ERROR: Cannot delete current snapshot\n");
+        goto fail_with_device_context;
+    }
+    dbs_extent_map *extent_map = get_snapshot_extent_map(&(metadata_context.device_context), volumes[volume_idx].volume_size, snapshot_id);
+    if (!extent_map)
+        goto fail_with_device_context;
+
+    // Get child snapshot id and load extents
+    uint16_t child_snapshot_id = find_child_snapshot_id(snapshots, snapshot_id);
+    dbs_extent_map *child_extent_map = get_snapshot_extent_map(&(metadata_context.device_context), volumes[volume_idx].volume_size, child_snapshot_id);
+    if (!child_extent_map) {
+        free_extent_map(extent_map);
+        goto fail_with_device_context;
+    }
+
+    // Merge extents with child
+    for (uint32_t extent_idx = 0; extent_idx <= extent_map->max_extent_idx; ) {
+        // If the region is empty, skip it completely
+        if (bitmap_region_is_empty(extent_map->extent_bitmap, extent_idx)) {
+            extent_idx += 32;
+            continue;
+        }
+        for (int i = 0; i < 32 && extent_idx <= extent_map->max_extent_idx; i++, extent_idx++) {
+            if (extent_map->extents[extent_idx].snapshot_id == 0 || child_extent_map->extents[extent_idx].snapshot_id != 0)
+                continue;
+            // Update metadata
+            extent_map->extents[extent_idx].snapshot_id = child_snapshot_id;
+            if (!write_extent_metadata(&(metadata_context.device_context), extent_map, extent_idx)) {
+                printf("ERROR: Failed writing metadata for extent %u: %s\n", extent_idx, strerror(errno));
+                goto fail_with_extent_maps;
+            }
+            extent_map->extents[extent_idx].snapshot_id == 0;
+        }
+    }
+    // Delete extents
+    if (!delete_extent_map(&(metadata_context.device_context), extent_map))
+        goto fail_with_extent_maps;
+
+    // Remove snapshot
+    snapshots[child_snapshot_id - 1].parent_snapshot_id = snapshots[snapshot_id - 1].parent_snapshot_id;
+    snapshots[snapshot_id - 1].parent_snapshot_id = 0;
+    snapshots[snapshot_id - 1].created_at = 0;
+    if (!write_device_metadata(&(metadata_context.device_context), &(metadata_context.device_metadata))) {
+        printf("ERROR: Failed writing volume metadata\n");
+        goto fail_with_device_context;
+    }
+
+    free_extent_map(child_extent_map);
+    free_extent_map(extent_map);
+    close(metadata_context.device_context.fd);
+    return DBS_SUCCESS;
+
+fail_with_extent_maps:
+    free_extent_map(child_extent_map);
+    free_extent_map(extent_map);
+fail_with_device_context:
+    close(metadata_context.device_context.fd);
     return DBS_FAILURE;
 }
 
@@ -525,50 +747,16 @@ dbs_context dbs_open(char *device, char *volume_name) {
     }
     memcpy(&(volume_context->device_context), &(metadata_context.device_context), sizeof(dbs_device_context));
     memcpy(&(volume_context->volume), &(volumes[volume_idx]), sizeof(dbs_volume_metadata));
-    volume_context->extent_map = get_extent_map(&(metadata_context.device_context), volumes[volume_idx].volume_size, volumes[volume_idx].snapshot_id);
+    volume_context->extent_map = get_volume_extent_map(&(metadata_context.device_context), volumes[volume_idx].volume_size, volumes[volume_idx].snapshot_id, snapshots);
     if (!volume_context->extent_map) {
         free(volume_context);
         goto fail_with_device_context;
-    }
-
-    // Populate extents
-    uint16_t snapshot_idx = volumes[volume_idx].snapshot_id - 1;
-    snapshot_idx = snapshots[snapshot_idx].parent_snapshot_id - 1;
-    for ( ; snapshot_idx >= 0; snapshot_idx = snapshots[snapshot_idx].parent_snapshot_id - 1) {
-        dbs_extent_map *extent_map = get_extent_map(&(metadata_context.device_context), volumes[volume_idx].volume_size, snapshot_idx + 1);
-        if (!extent_map) {
-            free(volume_context);
-            goto fail_with_device_context;
-        }
-        for (uint32_t extent_idx = 0; extent_idx <= extent_map->max_extent_idx; ) {
-            // If the region is empty, skip it completely
-            if (bitmap_region_is_empty(extent_map->extent_bitmap, extent_idx)) {
-                extent_idx += 32;
-                continue;
-            }
-            for (int i = 0; i < 32; i++) {
-                if (extent_map->extents[extent_idx].snapshot_id != 0 && volume_context->extent_map->extents[extent_idx].snapshot_id == 0) {
-                    memcpy(&(volume_context->extent_map->extents[extent_idx]), &(extent_map->extents[extent_idx]), sizeof(dbs_extent_metadata));
-                    volume_context->extent_map->allocated_volume_extents++;
-                    volume_context->extent_map->max_extent_idx = MAX(volume_context->extent_map->max_extent_idx, extent_idx);
-                    bitmap_set_bit(volume_context->extent_map->extent_bitmap, extent_idx);
-                }
-                extent_idx++;
-            }
-        }
-        free_extent_map(extent_map);
     }
 
     return (dbs_context)volume_context;
 
 fail_with_device_context:
     close(metadata_context.device_context.fd);
-    return NULL;
-
-fail_with_volume_context:
-    close(volume_context->device_context.fd);
-    free_extent_map(volume_context->extent_map);
-    free(volume_context);
     return NULL;
 }
 
@@ -615,6 +803,10 @@ dbs_bool dbs_write(dbs_context context, uint64_t block, void *data) {
     dbs_extent_metadata *extent_metadata = &(volume_context->extent_map->extents[extent_idx]);
     if (extent_metadata->snapshot_id == 0 || extent_metadata->snapshot_id != volume_context->volume.snapshot_id) {
         // Allocate new extent
+        if (volume_context->device_context.superblock.allocated_device_extents + 1 > volume_context->device_context.total_device_extents) {
+            printf("ERROR: No space left on device\n");
+            return DBS_FAILURE;
+        }
         extent_metadata->snapshot_id = volume_context->volume.snapshot_id;
         extent_metadata->extent_pos = volume_context->device_context.superblock.allocated_device_extents;
         if (!write_extent_metadata(&(volume_context->device_context), volume_context->extent_map, extent_idx)) {
