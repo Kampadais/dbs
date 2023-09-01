@@ -23,8 +23,8 @@ typedef struct {
 typedef struct {
     char volume_name[DBS_MAX_VOLUME_NAME_SIZE + 1];
     uint64_t volume_size;
-    time_t created_at;
     uint16_t snapshot_id;
+    time_t created_at;
     uint16_t snapshot_count;
 } dbs_volume_info;
 

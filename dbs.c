@@ -387,8 +387,8 @@ dbs_bool dbs_fill_volume_info(char *device, dbs_volume_info *volume_info, uint8_
         volume_info[*count].volume_name[DBS_MAX_VOLUME_NAME_SIZE] = '\0';
         volume_info[*count].volume_size = volumes[volume_idx].volume_size;
         uint16_t snapshot_id = volumes[volume_idx].snapshot_id;
-        volume_info[*count].created_at = snapshots[snapshot_id - 1].created_at;
         volume_info[*count].snapshot_id = snapshot_id;
+        volume_info[*count].created_at = snapshots[snapshot_id - 1].created_at;
         uint16_t snapshot_count = 0;
         for ( ; snapshot_id > 0; snapshot_id = snapshots[snapshot_id - 1].parent_snapshot_id)
             snapshot_count++;

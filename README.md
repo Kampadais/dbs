@@ -1,14 +1,19 @@
 # Direct Block Store
 
-A library for maintaining virtual volumes on top of a physical block device (or file). Snapshots supported.
+A library for maintaining virtual volumes on top of a physical block device (or file). Snapshots supported. Python and Go wrappers included.
 
-To test:
+To test using Python:
 ```sh
+# Create virtual environment
 python3 -m venv venv
 source venv/bin/activate
+
+# Install pydbs and test
 python3 setup.py install
 ./test.py
 ```
 
-Features missing:
-- Network frontend (nbd or other)
+To test using Go:
+```sh
+go test -p 1
+```

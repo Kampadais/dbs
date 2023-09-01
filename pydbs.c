@@ -1,3 +1,5 @@
+// +build ignore
+
 #define PY_SSIZE_T_CLEAN
 
 #include <Python.h>
@@ -19,8 +21,8 @@ static PyStructSequence_Field device_info_fields[] = {
 static PyStructSequence_Field volume_info_fields[] = {
     {"volume_name",                 NULL},
     {"volume_size",                 NULL},
-    {"created_at",                  NULL},
     {"snapshot_id",                 NULL},
+    {"created_at",                  NULL},
     {"snapshot_count",              NULL},
     {NULL}
 };
@@ -108,8 +110,8 @@ static PyObject *get_volume_info(PyObject* self, PyObject *args, PyObject *kw) {
         }
         PyStructSequence_SET_ITEM(volume_info_tuple, 0, Py_BuildValue("s", volume_info[i].volume_name));
         PyStructSequence_SET_ITEM(volume_info_tuple, 1, Py_BuildValue("K", volume_info[i].volume_size));
-        PyStructSequence_SET_ITEM(volume_info_tuple, 2, Py_BuildValue("L", volume_info[i].created_at));
-        PyStructSequence_SET_ITEM(volume_info_tuple, 3, Py_BuildValue("H", volume_info[i].snapshot_id));
+        PyStructSequence_SET_ITEM(volume_info_tuple, 2, Py_BuildValue("H", volume_info[i].snapshot_id));
+        PyStructSequence_SET_ITEM(volume_info_tuple, 3, Py_BuildValue("L", volume_info[i].created_at));
         PyStructSequence_SET_ITEM(volume_info_tuple, 4, Py_BuildValue("H", volume_info[i].snapshot_count));
         if (PyErr_Occurred()) {
             Py_DECREF(volume_info_tuple);
