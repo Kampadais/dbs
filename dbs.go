@@ -212,7 +212,7 @@ func OpenVolume(device string, volumeName string) (*Context, error) {
 	return ctx, nil
 }
 
-func (ctx *Context) Close() {
+func (ctx *Context) CloseVolume() {
 	C.dbs_close_volume(ctx.pointer)
 }
 
