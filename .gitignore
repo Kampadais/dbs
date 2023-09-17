@@ -1,6 +1,2 @@
-build/
-dist/
-*.egg-info/
-venv/
-
+dbsctl
 *.img

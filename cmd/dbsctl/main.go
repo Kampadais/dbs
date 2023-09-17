@@ -1,0 +1,185 @@
+// A command line utility exposing the query and management APIs of DBS.
+package main
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+
+	"github.com/docker/go-units"
+	"github.com/jawher/mow.cli"
+	"github.com/jedib0t/go-pretty/v6/table"
+
+	"github.com/chazapis/dbs"
+)
+
+var device *string
+
+func cmdGetDeviceInfo(cmd *cli.Cmd) {
+	cmd.Action = func() {
+		di, err := dbs.GetDeviceInfo(*device)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		t := table.NewWriter()
+		t.SetOutputMirror(os.Stdout)
+		t.AppendRows([]table.Row{
+			{"version", di.Version},
+			{"device_size", units.HumanSize(float64(di.DeviceSize))},
+			{"total_device_extents", di.TotalDeviceExtents},
+			{"allocated_device_extents", di.AllocatedDeviceExtents},
+			{"volume_count", di.VolumeCount},
+		})
+		t.Render()
+	}
+}
+
+func cmdGetVolumeInfo(cmd *cli.Cmd) {
+	cmd.Action = func() {
+		vi, err := dbs.GetVolumeInfo(*device)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		t := table.NewWriter()
+		t.SetOutputMirror(os.Stdout)
+		t.AppendRow(table.Row{"volume_name", "volume_size", "created_at", "snapshot_id", "snapshot_count"})
+		t.AppendSeparator()
+		for i := range vi {
+			t.AppendRow(table.Row{
+				vi[i].VolumeName,
+				units.HumanSize(float64(vi[i].VolumeSize)),
+				vi[i].CreatedAt,
+				vi[i].SnapshotId,
+				vi[i].SnapshotCount,
+			})
+		}
+		t.Render()
+	}
+}
+
+func cmdGetSnapshotInfo(cmd *cli.Cmd) {
+	volumeName := cmd.StringArg("VOLUME_NAME", "", "")
+	cmd.Action = func() {
+		si, err := dbs.GetSnapshotInfo(*device, *volumeName)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		t := table.NewWriter()
+		t.SetOutputMirror(os.Stdout)
+		t.AppendRow(table.Row{"snapshot_id", "parent_snapshot_id", "created_at"})
+		t.AppendSeparator()
+		for i := range si {
+			psid := strconv.Itoa(int(si[i].ParentSnapshotId))
+			if psid == "0" {
+				psid = "-"
+			}
+			t.AppendRow(table.Row{
+				si[i].SnapshotId,
+				psid,
+				si[i].CreatedAt,
+			})
+		}
+		t.Render()
+	}
+}
+
+func cmdInitDevice(cmd *cli.Cmd) {
+	cmd.Action = func() {
+		if err := dbs.InitDevice(*device); err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+func cmdVacuumDevice(cmd *cli.Cmd) {
+	cmd.Action = func() {
+		if err := dbs.VacuumDevice(*device); err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+func cmdCreateVolume(cmd *cli.Cmd) {
+	volumeName := cmd.StringArg("VOLUME_NAME", "", "")
+	volumeSize := cmd.StringArg("VOLUME_SIZE", "", "")
+	cmd.Action = func() {
+		bytesSize, err := units.FromHumanSize(*volumeSize)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		if err := dbs.CreateVolume(*device, *volumeName, uint64(bytesSize)); err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+func cmdRenameVolume(cmd *cli.Cmd) {
+	volumeName := cmd.StringArg("VOLUME_NAME", "", "")
+	newVolumeName := cmd.StringArg("NEW_VOLUME_NAME", "", "")
+	cmd.Action = func() {
+		if err := dbs.RenameVolume(*device, *volumeName, *newVolumeName); err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+func cmdCreateSnapshot(cmd *cli.Cmd) {
+	volumeName := cmd.StringArg("VOLUME_NAME", "", "")
+	cmd.Action = func() {
+		if err := dbs.CreateSnapshot(*device, *volumeName); err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+func cmdCloneSnapshot(cmd *cli.Cmd) {
+	newVolumeName := cmd.StringArg("NEW_VOLUME_NAME", "", "")
+	snapshotId := cmd.IntArg("SNAPSHOT_ID", 0, "")
+	cmd.Action = func() {
+		if err := dbs.CloneSnapshot(*device, *newVolumeName, uint(*snapshotId)); err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+func cmdDeleteVolume(cmd *cli.Cmd) {
+	volumeName := cmd.StringArg("VOLUME_NAME", "", "")
+	cmd.Action = func() {
+		if err := dbs.DeleteVolume(*device, *volumeName); err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+func cmdDeleteSnapshot(cmd *cli.Cmd) {
+	snapshotId := cmd.IntArg("SNAPSHOT_ID", 0, "")
+	cmd.Action = func() {
+		if err := dbs.DeleteSnapshot(*device, uint(*snapshotId)); err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+func main() {
+	app := cli.App("dbsctl", "DBS command line tool")
+	device = app.StringArg("DEVICE", "", "")
+	app.Command("get_device_info", "", cmdGetDeviceInfo)
+	app.Command("get_volume_info", "", cmdGetVolumeInfo)
+	app.Command("get_snapshot_info", "", cmdGetSnapshotInfo)
+	app.Command("init_device", "", cmdInitDevice)
+	app.Command("vacuum_device", "", cmdVacuumDevice)
+	app.Command("create_volume", "", cmdCreateVolume)
+	app.Command("rename_volume", "", cmdRenameVolume)
+	app.Command("create_snapshot", "", cmdCreateSnapshot)
+	app.Command("clone_snapshot", "", cmdCloneSnapshot)
+	app.Command("delete_volume", "", cmdDeleteVolume)
+	app.Command("delete_snapshot", "", cmdDeleteSnapshot)
+	app.Run(os.Args)
+}
