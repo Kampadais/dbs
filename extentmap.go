@@ -89,13 +89,9 @@ func (em *ExtentMap) NewExtentToSnapshot(eidx uint32, snapshotId uint16) error {
 
 // Copy over all data from an extent to another snapshot and update the map.
 func (em *ExtentMap) CopyExtentToSnapshot(eidx uint32, snapshotId uint16) error {
-	var data [EXTENT_SIZE]byte
 	psrc := em.extents[eidx].ExtentPos
 	pdst := em.dc.superblock.AllocatedDeviceExtents
-	if err := em.dc.ReadExtentData(data[:], uint(psrc)); err != nil {
-		return err
-	}
-	if err := em.dc.WriteExtentData(data[:], uint(pdst)); err != nil {
+	if err := em.dc.CopyExtentData(uint(psrc), uint(pdst)); err != nil {
 		return err
 	}
 	em.extents[eidx].SnapshotId = snapshotId

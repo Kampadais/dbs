@@ -21,7 +21,7 @@ const (
 )
 
 func Test(t *testing.T) {
-	// InitDevice(DEVICE)
+	InitDevice(DEVICE)
 	TestingT(t)
 }
 
@@ -301,7 +301,7 @@ func readBlocks(c *C, vc *VolumeContext, blockIndices []int, blockData [][]byte)
 	data := make([]byte, 512)
 	blockCount := len(blockData)
 	for i, _ := range blockIndices {
-		err := vc.ReadBlock(uint64(blockIndices[i]), data)
+		err := vc.ReadBlock(data, uint64(blockIndices[i]))
 		c.Assert(err, IsNil)
 		c.Assert(data, DeepEquals, blockData[i%blockCount])
 	}
@@ -310,7 +310,7 @@ func readBlocks(c *C, vc *VolumeContext, blockIndices []int, blockData [][]byte)
 func writeBlocks(c *C, vc *VolumeContext, blockIndices []int, blockData [][]byte) {
 	blockCount := len(blockData)
 	for i, _ := range blockIndices {
-		err := vc.WriteBlock(uint64(blockIndices[i]), blockData[i%blockCount])
+		err := vc.WriteBlock(blockData[i%blockCount], uint64(blockIndices[i]))
 		c.Assert(err, IsNil)
 	}
 }

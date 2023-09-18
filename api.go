@@ -136,7 +136,6 @@ func GetSnapshotInfo(device string, volumeName string) ([]SnapshotInfo, error) {
 		return nil, fmt.Errorf("volume %v not found", volumeName)
 	}
 	si := make([]SnapshotInfo, dc.CountSnapshots(v))
-	fmt.Println()
 	siidx := 0
 	for sid := v.SnapshotId; sid > 0; sid = dc.snapshots[sid-1].ParentSnapshotId {
 		si[siidx].SnapshotId = uint(sid)
@@ -361,7 +360,7 @@ func (vc *VolumeContext) CloseVolume() error {
 	return vc.dc.Close()
 }
 
-func (vc *VolumeContext) ReadBlock(block uint64, data []byte) error {
+func (vc *VolumeContext) ReadBlock(data []byte, block uint64) error {
 	eidx := uint(block >> BLOCK_BITS_IN_EXTENT)
 	if eidx > vc.vem.totalVolumeExtents {
 		return fmt.Errorf("block offset out of bounds")
@@ -381,7 +380,35 @@ func (vc *VolumeContext) ReadBlock(block uint64, data []byte) error {
 	return nil
 }
 
-func (vc *VolumeContext) WriteBlock(block uint64, data []byte) error {
+func (vc *VolumeContext) ReadAt(data []byte, offset uint64) error {
+	doffset := uint64(0)
+	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data))-doffset {
+		block := (offset + doffset) / 512
+		boffset := (offset + doffset) % 512
+		if boffset == 0 && remaining >= 512 {
+			if err := vc.ReadBlock(data[doffset:], block); err != nil {
+				return err
+			}
+			doffset += 512
+		} else {
+			buf := make([]byte, 512)
+			if err := vc.ReadBlock(buf, block); err != nil {
+				return err
+			}
+			dlength := 512 - boffset
+			if remaining < dlength {
+				copy(data[doffset:doffset+remaining], buf[boffset:remaining])
+				doffset += remaining
+			} else {
+				copy(data[doffset:doffset+dlength], buf[boffset:dlength])
+				doffset += dlength
+			}
+		}
+	}
+	return nil
+}
+
+func (vc *VolumeContext) WriteBlock(data []byte, block uint64) error {
 	eidx := uint(block >> BLOCK_BITS_IN_EXTENT)
 	if eidx > vc.vem.totalVolumeExtents {
 		return fmt.Errorf("block offset out of bounds")
@@ -421,6 +448,37 @@ func (vc *VolumeContext) WriteBlock(block uint64, data []byte) error {
 	return nil
 }
 
+func (vc *VolumeContext) WriteAt(data []byte, offset uint64) error {
+	doffset := uint64(0)
+	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data))-doffset {
+		block := (offset + doffset) / 512
+		boffset := (offset + doffset) % 512
+		if boffset == 0 && remaining >= 512 {
+			if err := vc.WriteBlock(data[doffset:], block); err != nil {
+				return err
+			}
+			doffset += 512
+		} else {
+			buf := make([]byte, 512)
+			if err := vc.ReadBlock(buf, block); err != nil {
+				return err
+			}
+			dlength := 512 - boffset
+			if remaining < dlength {
+				copy(buf[boffset:remaining], data[doffset:doffset+remaining])
+				doffset += remaining
+			} else {
+				copy(buf[boffset:dlength], data[doffset:doffset+dlength])
+				doffset += dlength
+			}
+			if err := vc.WriteBlock(buf, block); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (vc *VolumeContext) UnmapBlock(block uint64) error {
 	eidx := uint(block >> BLOCK_BITS_IN_EXTENT)
 	if eidx > vc.vem.totalVolumeExtents {
@@ -441,6 +499,28 @@ func (vc *VolumeContext) UnmapBlock(block uint64) error {
 	}
 	if err := vc.vem.WriteExtent(uint32(eidx)); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (vc *VolumeContext) UnmapAt(data []byte, offset uint64) error {
+	doffset := uint64(0)
+	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data))-doffset {
+		block := (offset + doffset) / 512
+		boffset := (offset + doffset) % 512
+		if boffset == 0 && remaining >= 512 {
+			if err := vc.UnmapBlock(block); err != nil {
+				return err
+			}
+			doffset += 512
+		} else {
+			dlength := 512 - boffset
+			if remaining < dlength {
+				doffset += remaining
+			} else {
+				doffset += dlength
+			}
+		}
 	}
 	return nil
 }

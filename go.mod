@@ -3,6 +3,7 @@ module github.com/chazapis/dbs
 go 1.21
 
 require (
+	github.com/chazapis/directio v0.0.0-20230918150548-7c9b3df83c98
 	github.com/docker/go-units v0.5.0
 	github.com/jawher/mow.cli v1.2.0
 	github.com/jedib0t/go-pretty/v6 v6.4.7
@@ -13,10 +14,10 @@ require (
 
 require (
 	github.com/kelindar/simd v1.1.2 // indirect
-	github.com/klauspost/cpuid/v2 v2.2.4 // indirect
+	github.com/klauspost/cpuid/v2 v2.2.5 // indirect
 	github.com/kr/pretty v0.2.1 // indirect
 	github.com/kr/text v0.1.0 // indirect
 	github.com/mattn/go-runewidth v0.0.13 // indirect
 	github.com/rivo/uniseg v0.2.0 // indirect
-	golang.org/x/sys v0.11.0 // indirect
+	golang.org/x/sys v0.12.0 // indirect
 )

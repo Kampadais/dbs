@@ -1,10 +1,13 @@
 package dbs
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/chazapis/directio"
 )
 
 const (
@@ -17,7 +20,7 @@ func divRoundUp(x uint, y uint) uint {
 
 // The device context holds the device file descriptor and all metadata except extents.
 type DeviceContext struct {
-	f                  *os.File
+	f                  *DirectFile
 	superblock         *Superblock
 	volumes            [MAX_VOLUMES]VolumeMetadata
 	snapshots          [MAX_SNAPSHOTS]SnapshotMetadata
@@ -28,16 +31,14 @@ type DeviceContext struct {
 
 // Initialize a new, empty device context.
 func NewDeviceContext(device string) (*DeviceContext, error) {
-	f, err := os.OpenFile(device, os.O_RDWR, 0660)
+	f, err := NewDirectFile(device, os.O_RDWR, 0660)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open %v: %w", device, err)
 	}
-
-	stat, err := f.Stat()
+	deviceSize, err := f.Size()
 	if err != nil {
-		return nil, fmt.Errorf("cannot stat %v: %w", device, err)
+		return nil, err
 	}
-	deviceSize := stat.Size()
 	if deviceSize == 0 {
 		return nil, fmt.Errorf("device with zero size")
 	}
@@ -59,7 +60,6 @@ func NewDeviceContext(device string) (*DeviceContext, error) {
 	dc.dataOffset = divRoundUp(metadataSize, EXTENT_SIZE) * EXTENT_SIZE
 	// Account for storage of extent metadata
 	dc.totalDeviceExtents -= (dc.totalDeviceExtents * SIZEOF_EXTENT_METADATA) / EXTENT_SIZE
-
 	return dc, nil
 }
 
@@ -79,11 +79,14 @@ func GetDeviceContext(device string) (*DeviceContext, error) {
 
 func (dc *DeviceContext) ReadSuperblock() error {
 	var sb Superblock
-	if _, err := dc.f.Seek(0, 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
-	}
-	if err := binary.Read(dc.f, binary.LittleEndian, &sb); err != nil {
+	abuf := directio.AlignedBlock(512)
+	n, err := dc.f.ReadAt(abuf, 0)
+	if err != nil {
 		return fmt.Errorf("failed to read superblock: %w", err)
+	}
+	buf := bytes.NewBuffer(abuf)
+	if err := binary.Read(buf, binary.LittleEndian, &sb); err != nil {
+		return fmt.Errorf("failed to deserialize superblock: %w", err)
 	}
 	if dc.superblock.Version != sb.Version {
 		return fmt.Errorf("version mismatch in superblock")
@@ -96,107 +99,105 @@ func (dc *DeviceContext) ReadSuperblock() error {
 }
 
 func (dc *DeviceContext) ReadMetadata() error {
-	if _, err := dc.f.Seek(512, 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
+	abuf := directio.AlignedBlock(int(dc.extentOffset-512))
+	if _, err := dc.f.ReadAt(abuf, 512); err != nil {
+		return fmt.Errorf("failed to read metadata: %w", err)
 	}
-	if err := binary.Read(dc.f, binary.LittleEndian, dc.volumes[:]); err != nil {
-		return fmt.Errorf("failed to read volume metadata: %w", err)
+	buf := bytes.NewBuffer(abuf)
+	if err := binary.Read(buf, binary.LittleEndian, dc.volumes[:]); err != nil {
+		return fmt.Errorf("failed to deserialize volume metadata: %w", err)
 	}
-	if err := binary.Read(dc.f, binary.LittleEndian, dc.snapshots[:]); err != nil {
-		return fmt.Errorf("failed to read snapshot metadata: %w", err)
+	if err := binary.Read(buf, binary.LittleEndian, dc.snapshots[:]); err != nil {
+		return fmt.Errorf("failed to deserialize snapshot metadata: %w", err)
 	}
 	return nil
 }
 
 func (dc *DeviceContext) ReadExtents(eb []ExtentMetadata, eidx uint) error {
-	if _, err := dc.f.Seek(int64(dc.extentOffset+(eidx*SIZEOF_EXTENT_METADATA)), 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
-	}
-	if err := binary.Read(dc.f, binary.LittleEndian, eb); err != nil {
+	offset := uint64(dc.extentOffset+(eidx*SIZEOF_EXTENT_METADATA))
+	size := uint64(binary.Size(eb))
+	blocks := ((offset+size)/512) - (offset/512) + 1
+	abuf := directio.AlignedBlock(int(512 * blocks))
+	if _, err := dc.f.ReadAt(abuf, (offset/512)*512); err != nil {
 		return fmt.Errorf("failed to read extent metadata: %w", err)
 	}
-	return nil
-}
-
-func (dc *DeviceContext) ReadExtentData(data []byte, epos uint) error {
-	if _, err := dc.f.Seek(int64(dc.dataOffset+(epos*EXTENT_SIZE)), 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
-	}
-	if _, err := dc.f.Read(data); err != nil {
-		return fmt.Errorf("failed to read extent data: %w", err)
+	buf := bytes.NewBuffer(abuf[offset%512:(offset%512)+size])
+	if err := binary.Read(buf, binary.LittleEndian, eb); err != nil {
+		return fmt.Errorf("failed to deserialize extent metadata: %w", err)
 	}
 	return nil
 }
 
 func (dc *DeviceContext) ReadBlockData(data []byte, epos uint, bidx uint) error {
-	if _, err := dc.f.Seek(int64(dc.dataOffset+(epos*EXTENT_SIZE)+(bidx*512)), 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
-	}
-	if _, err := dc.f.Read(data[0:512]); err != nil {
+	offset := uint64(dc.dataOffset+(epos*EXTENT_SIZE)+(bidx*512))
+	if _, err := dc.f.ReadAt(data[0:512], offset); err != nil {
 		return fmt.Errorf("failed to read block: %w", err)
 	}
 	return nil
 }
 
 func (dc *DeviceContext) WriteSuperblock() error {
-	if _, err := dc.f.Seek(0, 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
+	buf := bytes.NewBuffer(directio.AlignedBlock(512))
+	if err := binary.Write(buf, binary.LittleEndian, dc.superblock); err != nil {
+		return fmt.Errorf("failed to serialize superblock: %w", err)
 	}
-	if err := binary.Write(dc.f, binary.LittleEndian, dc.superblock); err != nil {
+	if _, err := dc.f.WriteAt(buf.Bytes(), 0); err != nil {
 		return fmt.Errorf("failed to write superblock: %w", err)
 	}
 	return nil
 }
 
 func (dc *DeviceContext) WriteMetadata() error {
-	if _, err := dc.f.Seek(512, 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
+	buf := bytes.NewBuffer(directio.AlignedBlock(int(dc.extentOffset-512)))
+	if err := binary.Write(buf, binary.LittleEndian, dc.volumes); err != nil {
+		return fmt.Errorf("failed to serialize volume metadata: %w", err)
 	}
-	if err := binary.Write(dc.f, binary.LittleEndian, dc.volumes); err != nil {
-		return fmt.Errorf("failed to write volume metadata: %w", err)
+	if err := binary.Write(buf, binary.LittleEndian, dc.snapshots); err != nil {
+		return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
 	}
-	if err := binary.Write(dc.f, binary.LittleEndian, dc.snapshots); err != nil {
-		return fmt.Errorf("failed to write snapshot metadata: %w", err)
-	}
-	return nil
-}
-
-func (dc *DeviceContext) WriteExtent(e *ExtentMetadata, eidx uint) error {
-	if _, err := dc.f.Seek(int64(dc.extentOffset+(eidx*SIZEOF_EXTENT_METADATA)), 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
-	}
-	if err := binary.Write(dc.f, binary.LittleEndian, e); err != nil {
-		return fmt.Errorf("failed to write extent metadata: %w", err)
+	if _, err := dc.f.WriteAt(buf.Bytes(), 512); err != nil {
+		return fmt.Errorf("failed to write metadata: %w", err)
 	}
 	return nil
 }
 
 func (dc *DeviceContext) WriteExtents(eb []ExtentMetadata, eidx uint) error {
-	if _, err := dc.f.Seek(int64(dc.extentOffset+(eidx*SIZEOF_EXTENT_METADATA)), 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
+	offset := uint64(dc.extentOffset+(eidx*SIZEOF_EXTENT_METADATA))
+	size := uint64(binary.Size(eb))
+	blocks := ((offset+size)/512) - (offset/512) + 1
+	abuf := directio.AlignedBlock(int(512 * blocks))
+	if _, err := dc.f.ReadAt(abuf, (offset/512)*512); err != nil {
+		return fmt.Errorf("failed to read extent metadata: %w", err)
 	}
-	if err := binary.Write(dc.f, binary.LittleEndian, eb); err != nil {
-		return fmt.Errorf("failed to write extent metadata: %w", err)
+	buf := bytes.NewBuffer(abuf[offset%512:(offset%512)+size])
+	if err := binary.Write(buf, binary.LittleEndian, eb); err != nil {
+		return fmt.Errorf("failed to serialize extent metadata: %w", err)
+	}
+	if _, err := dc.f.WriteAt(abuf, (offset/512)*512); err != nil {
+		return fmt.Errorf("failed to write§ extent metadata: %w", err)
 	}
 	return nil
 }
 
-func (dc *DeviceContext) WriteExtentData(data []byte, epos uint) error {
-	if _, err := dc.f.Seek(int64(dc.dataOffset+(epos*EXTENT_SIZE)), 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
-	}
-	if _, err := dc.f.Write(data); err != nil {
-		return fmt.Errorf("failed to write extent data: %w", err)
-	}
-	return nil
+func (dc *DeviceContext) WriteExtent(e *ExtentMetadata, eidx uint) error {
+	return dc.WriteExtents([]ExtentMetadata{*e}, eidx)
 }
 
 func (dc *DeviceContext) WriteBlockData(data []byte, epos uint, bidx uint) error {
-	if _, err := dc.f.Seek(int64(dc.dataOffset+(epos*EXTENT_SIZE)+(bidx*512)), 0); err != nil {
-		return fmt.Errorf("cannot seek into device: %w", err)
-	}
-	if _, err := dc.f.Write(data[0:512]); err != nil {
+	offset := uint64(dc.dataOffset+(epos*EXTENT_SIZE)+(bidx*512))
+	if _, err := dc.f.WriteAt(data[0:512], offset); err != nil {
 		return fmt.Errorf("failed to write block: %w", err)
+	}
+	return nil
+}
+
+func (dc *DeviceContext) CopyExtentData(esrc uint, edst uint) error {
+	buf := directio.AlignedBlock(EXTENT_SIZE)
+	if _, err := dc.f.ReadAt(buf, uint64(dc.dataOffset+(esrc*EXTENT_SIZE))); err != nil {
+		return fmt.Errorf("failed to read extent data: %w", err)
+	}
+	if _, err := dc.f.WriteAt(buf, uint64(dc.dataOffset+(edst*EXTENT_SIZE))); err != nil {
+		return fmt.Errorf("failed to read extent data: %w", err)
 	}
 	return nil
 }
