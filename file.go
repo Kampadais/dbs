@@ -40,13 +40,13 @@ func (file *DirectFile) ReadAt(data []byte, offset uint64) (int, error) {
 	}
 	buf := directio.AlignedBlock(len(data))
 	n, err := file.File.ReadAt(buf, int64(offset))
-	if err != nil {
+	if err == nil {
 		copy(data, buf)
 	}
 	return n, err
 }
 
-// Write using direct I/O,
+// Write using direct I/O
 func (file *DirectFile) WriteAt(data []byte, offset uint64) (int, error) {
 	if directio.IsAligned(data) {
 		return file.File.WriteAt(data, int64(offset))

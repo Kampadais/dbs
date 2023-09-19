@@ -80,13 +80,15 @@ func GetDeviceContext(device string) (*DeviceContext, error) {
 func (dc *DeviceContext) ReadSuperblock() error {
 	var sb Superblock
 	abuf := directio.AlignedBlock(512)
-	n, err := dc.f.ReadAt(abuf, 0)
-	if err != nil {
+	if _, err := dc.f.ReadAt(abuf, 0); err != nil {
 		return fmt.Errorf("failed to read superblock: %w", err)
 	}
 	buf := bytes.NewBuffer(abuf)
 	if err := binary.Read(buf, binary.LittleEndian, &sb); err != nil {
 		return fmt.Errorf("failed to deserialize superblock: %w", err)
+	}
+	if dc.superblock.Magic != sb.Magic {
+		return fmt.Errorf("device not initialized")
 	}
 	if dc.superblock.Version != sb.Version {
 		return fmt.Errorf("version mismatch in superblock")
@@ -99,7 +101,7 @@ func (dc *DeviceContext) ReadSuperblock() error {
 }
 
 func (dc *DeviceContext) ReadMetadata() error {
-	abuf := directio.AlignedBlock(int(dc.extentOffset-512))
+	abuf := directio.AlignedBlock(int(dc.extentOffset - 512))
 	if _, err := dc.f.ReadAt(abuf, 512); err != nil {
 		return fmt.Errorf("failed to read metadata: %w", err)
 	}
@@ -114,14 +116,14 @@ func (dc *DeviceContext) ReadMetadata() error {
 }
 
 func (dc *DeviceContext) ReadExtents(eb []ExtentMetadata, eidx uint) error {
-	offset := uint64(dc.extentOffset+(eidx*SIZEOF_EXTENT_METADATA))
+	offset := uint64(dc.extentOffset + (eidx * SIZEOF_EXTENT_METADATA))
 	size := uint64(binary.Size(eb))
-	blocks := ((offset+size)/512) - (offset/512) + 1
+	blocks := ((offset + size) / 512) - (offset / 512) + 1
 	abuf := directio.AlignedBlock(int(512 * blocks))
 	if _, err := dc.f.ReadAt(abuf, (offset/512)*512); err != nil {
 		return fmt.Errorf("failed to read extent metadata: %w", err)
 	}
-	buf := bytes.NewBuffer(abuf[offset%512:(offset%512)+size])
+	buf := bytes.NewBuffer(abuf[offset%512 : (offset%512)+size])
 	if err := binary.Read(buf, binary.LittleEndian, eb); err != nil {
 		return fmt.Errorf("failed to deserialize extent metadata: %w", err)
 	}
@@ -129,7 +131,7 @@ func (dc *DeviceContext) ReadExtents(eb []ExtentMetadata, eidx uint) error {
 }
 
 func (dc *DeviceContext) ReadBlockData(data []byte, epos uint, bidx uint) error {
-	offset := uint64(dc.dataOffset+(epos*EXTENT_SIZE)+(bidx*512))
+	offset := uint64(dc.dataOffset + (epos * EXTENT_SIZE) + (bidx * 512))
 	if _, err := dc.f.ReadAt(data[0:512], offset); err != nil {
 		return fmt.Errorf("failed to read block: %w", err)
 	}
@@ -137,44 +139,49 @@ func (dc *DeviceContext) ReadBlockData(data []byte, epos uint, bidx uint) error 
 }
 
 func (dc *DeviceContext) WriteSuperblock() error {
-	buf := bytes.NewBuffer(directio.AlignedBlock(512))
+	buf := new(bytes.Buffer)
 	if err := binary.Write(buf, binary.LittleEndian, dc.superblock); err != nil {
 		return fmt.Errorf("failed to serialize superblock: %w", err)
 	}
-	if _, err := dc.f.WriteAt(buf.Bytes(), 0); err != nil {
+	abuf := directio.AlignedBlock(512)
+	copy(abuf[0:], buf.Bytes())
+	if _, err := dc.f.WriteAt(abuf, 0); err != nil {
 		return fmt.Errorf("failed to write superblock: %w", err)
 	}
 	return nil
 }
 
 func (dc *DeviceContext) WriteMetadata() error {
-	buf := bytes.NewBuffer(directio.AlignedBlock(int(dc.extentOffset-512)))
+	buf := new(bytes.Buffer)
 	if err := binary.Write(buf, binary.LittleEndian, dc.volumes); err != nil {
 		return fmt.Errorf("failed to serialize volume metadata: %w", err)
 	}
 	if err := binary.Write(buf, binary.LittleEndian, dc.snapshots); err != nil {
 		return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
 	}
-	if _, err := dc.f.WriteAt(buf.Bytes(), 512); err != nil {
+	abuf := directio.AlignedBlock(int(dc.extentOffset - 512))
+	copy(abuf[0:], buf.Bytes())
+	if _, err := dc.f.WriteAt(abuf, 512); err != nil {
 		return fmt.Errorf("failed to write metadata: %w", err)
 	}
 	return nil
 }
 
 func (dc *DeviceContext) WriteExtents(eb []ExtentMetadata, eidx uint) error {
-	offset := uint64(dc.extentOffset+(eidx*SIZEOF_EXTENT_METADATA))
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, eb); err != nil {
+		return fmt.Errorf("failed to serialize extent metadata: %w", err)
+	}
+	offset := uint64(dc.extentOffset + (eidx * SIZEOF_EXTENT_METADATA))
 	size := uint64(binary.Size(eb))
-	blocks := ((offset+size)/512) - (offset/512) + 1
+	blocks := ((offset + size) / 512) - (offset / 512) + 1
 	abuf := directio.AlignedBlock(int(512 * blocks))
 	if _, err := dc.f.ReadAt(abuf, (offset/512)*512); err != nil {
 		return fmt.Errorf("failed to read extent metadata: %w", err)
 	}
-	buf := bytes.NewBuffer(abuf[offset%512:(offset%512)+size])
-	if err := binary.Write(buf, binary.LittleEndian, eb); err != nil {
-		return fmt.Errorf("failed to serialize extent metadata: %w", err)
-	}
+	copy(abuf[offset%512:(offset%512)+size], buf.Bytes())
 	if _, err := dc.f.WriteAt(abuf, (offset/512)*512); err != nil {
-		return fmt.Errorf("failed to write§ extent metadata: %w", err)
+		return fmt.Errorf("failed to write extent metadata: %w", err)
 	}
 	return nil
 }
@@ -184,7 +191,7 @@ func (dc *DeviceContext) WriteExtent(e *ExtentMetadata, eidx uint) error {
 }
 
 func (dc *DeviceContext) WriteBlockData(data []byte, epos uint, bidx uint) error {
-	offset := uint64(dc.dataOffset+(epos*EXTENT_SIZE)+(bidx*512))
+	offset := uint64(dc.dataOffset + (epos * EXTENT_SIZE) + (bidx * 512))
 	if _, err := dc.f.WriteAt(data[0:512], offset); err != nil {
 		return fmt.Errorf("failed to write block: %w", err)
 	}
@@ -192,11 +199,11 @@ func (dc *DeviceContext) WriteBlockData(data []byte, epos uint, bidx uint) error
 }
 
 func (dc *DeviceContext) CopyExtentData(esrc uint, edst uint) error {
-	buf := directio.AlignedBlock(EXTENT_SIZE)
-	if _, err := dc.f.ReadAt(buf, uint64(dc.dataOffset+(esrc*EXTENT_SIZE))); err != nil {
+	abuf := directio.AlignedBlock(EXTENT_SIZE)
+	if _, err := dc.f.ReadAt(abuf, uint64(dc.dataOffset+(esrc*EXTENT_SIZE))); err != nil {
 		return fmt.Errorf("failed to read extent data: %w", err)
 	}
-	if _, err := dc.f.WriteAt(buf, uint64(dc.dataOffset+(edst*EXTENT_SIZE))); err != nil {
+	if _, err := dc.f.WriteAt(abuf, uint64(dc.dataOffset+(edst*EXTENT_SIZE))); err != nil {
 		return fmt.Errorf("failed to read extent data: %w", err)
 	}
 	return nil

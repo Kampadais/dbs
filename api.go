@@ -382,7 +382,7 @@ func (vc *VolumeContext) ReadBlock(data []byte, block uint64) error {
 
 func (vc *VolumeContext) ReadAt(data []byte, offset uint64) error {
 	doffset := uint64(0)
-	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data))-doffset {
+	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data)) - doffset {
 		block := (offset + doffset) / 512
 		boffset := (offset + doffset) % 512
 		if boffset == 0 && remaining >= 512 {
@@ -450,7 +450,7 @@ func (vc *VolumeContext) WriteBlock(data []byte, block uint64) error {
 
 func (vc *VolumeContext) WriteAt(data []byte, offset uint64) error {
 	doffset := uint64(0)
-	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data))-doffset {
+	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data)) - doffset {
 		block := (offset + doffset) / 512
 		boffset := (offset + doffset) % 512
 		if boffset == 0 && remaining >= 512 {
@@ -505,7 +505,7 @@ func (vc *VolumeContext) UnmapBlock(block uint64) error {
 
 func (vc *VolumeContext) UnmapAt(data []byte, offset uint64) error {
 	doffset := uint64(0)
-	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data))-doffset {
+	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data)) - doffset {
 		block := (offset + doffset) / 512
 		boffset := (offset + doffset) % 512
 		if boffset == 0 && remaining >= 512 {
