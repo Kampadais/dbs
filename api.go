@@ -279,6 +279,7 @@ func DeleteVolume(device string, volumeName string) error {
 		if err := sem.ClearAll(); err != nil {
 			return err
 		}
+		dc.snapshots[sid-1].CreatedAt = 0
 	}
 	*v = VolumeMetadata{}
 	if err := dc.WriteMetadata(); err != nil {
