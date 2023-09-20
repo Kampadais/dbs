@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/chazapis/directio"
+	"github.com/ncw/directio"
 )
 
 // Wrapper to file object supporting direct I/O

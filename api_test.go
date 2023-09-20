@@ -289,16 +289,16 @@ func loadBlocks() [][]byte {
 	if err != nil {
 		panic("")
 	}
-	blockCount := len(data) / 512
+	blockCount := len(data) / BLOCK_SIZE
 	blockData := make([][]byte, blockCount)
 	for i := 0; i < blockCount; i++ {
-		blockData[i] = data[i*512 : (i+1)*512]
+		blockData[i] = data[i*BLOCK_SIZE : (i+1)*BLOCK_SIZE]
 	}
 	return blockData
 }
 
 func readBlocks(c *C, vc *VolumeContext, blockIndices []int, blockData [][]byte) {
-	data := make([]byte, 512)
+	data := make([]byte, BLOCK_SIZE)
 	blockCount := len(blockData)
 	for i, _ := range blockIndices {
 		err := vc.ReadBlock(data, uint64(blockIndices[i]))
@@ -344,7 +344,7 @@ func (s *TestSuite) TestVolumeIO(c *C) {
 	c.Assert(err, IsNil)
 
 	// Read (should get empty data)
-	emptyBlock := make([]byte, 512)
+	emptyBlock := make([]byte, BLOCK_SIZE)
 	readBlocks(c, vc, blockIndices, [][]byte{emptyBlock})
 
 	// Write and read back
@@ -408,8 +408,8 @@ func (s *TestSuite) TestSnapshotIO(c *C) {
 	readBlocks(c, vc, blockIndices, blockData)
 
 	// Overwrite and read back
-	dummyBlock := make([]byte, 512)
-	for i := 0; i < 512; i++ {
+	dummyBlock := make([]byte, BLOCK_SIZE)
+	for i := 0; i < BLOCK_SIZE; i++ {
 		dummyBlock[i] = 0xF0
 	}
 	writeBlocks(c, vc, blockIndices, [][]byte{dummyBlock})

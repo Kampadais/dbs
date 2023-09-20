@@ -2,8 +2,8 @@
 // Snapshots supported. Command-line utility for query and management operations included.
 //
 // Device layout:
-//   - Bytes [0, 512) contain the the superblock
-//   - Bytes [512, ExtentOffset) hold the volume and snapshot metadata (ExtentOffset is block aligned)
+//   - Bytes [0, 4096) contain the the superblock
+//   - Bytes [4096, ExtentOffset) hold the volume and snapshot metadata (ExtentOffset is block aligned)
 //   - Bytes [ExtentOffset, DataOffset) hold the extent metadata (DataOffset is extent aligned)
 //   - Bytes [DataOffset, DeviceSize) hold the data
 package dbs
@@ -24,7 +24,8 @@ const (
 	MAX_SNAPSHOTS        = 65535
 	MAX_VOLUME_NAME_SIZE = 255
 
-	EXTENT_SIZE          = 131072 // 128 KB
+	BLOCK_SIZE           = 4096
+	EXTENT_SIZE          = 1048576 // 1 MB
 	EXTENT_BITMAP_SIZE   = 32
 	BLOCK_BITS_IN_EXTENT = 8
 	BLOCK_MASK_IN_EXTENT = 0xFF
@@ -334,7 +335,7 @@ type VolumeContext struct {
 	vem    *ExtentMap
 }
 
-var emptyBlock [512]byte
+var emptyBlock [BLOCK_SIZE]byte
 
 func OpenVolume(device string, volumeName string) (*VolumeContext, error) {
 	dc, err := GetDeviceContext(device)
@@ -384,19 +385,19 @@ func (vc *VolumeContext) ReadBlock(data []byte, block uint64) error {
 func (vc *VolumeContext) ReadAt(data []byte, offset uint64) error {
 	doffset := uint64(0)
 	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data)) - doffset {
-		block := (offset + doffset) / 512
-		boffset := (offset + doffset) % 512
-		if boffset == 0 && remaining >= 512 {
+		block := (offset + doffset) / BLOCK_SIZE
+		boffset := (offset + doffset) % BLOCK_SIZE
+		if boffset == 0 && remaining >= BLOCK_SIZE {
 			if err := vc.ReadBlock(data[doffset:], block); err != nil {
 				return err
 			}
-			doffset += 512
+			doffset += BLOCK_SIZE
 		} else {
-			buf := make([]byte, 512)
+			buf := make([]byte, BLOCK_SIZE)
 			if err := vc.ReadBlock(buf, block); err != nil {
 				return err
 			}
-			dlength := 512 - boffset
+			dlength := BLOCK_SIZE - boffset
 			if remaining < dlength {
 				copy(data[doffset:doffset+remaining], buf[boffset:remaining])
 				doffset += remaining
@@ -452,19 +453,19 @@ func (vc *VolumeContext) WriteBlock(data []byte, block uint64) error {
 func (vc *VolumeContext) WriteAt(data []byte, offset uint64) error {
 	doffset := uint64(0)
 	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data)) - doffset {
-		block := (offset + doffset) / 512
-		boffset := (offset + doffset) % 512
-		if boffset == 0 && remaining >= 512 {
+		block := (offset + doffset) / BLOCK_SIZE
+		boffset := (offset + doffset) % BLOCK_SIZE
+		if boffset == 0 && remaining >= BLOCK_SIZE {
 			if err := vc.WriteBlock(data[doffset:], block); err != nil {
 				return err
 			}
-			doffset += 512
+			doffset += BLOCK_SIZE
 		} else {
-			buf := make([]byte, 512)
+			buf := make([]byte, BLOCK_SIZE)
 			if err := vc.ReadBlock(buf, block); err != nil {
 				return err
 			}
-			dlength := 512 - boffset
+			dlength := BLOCK_SIZE - boffset
 			if remaining < dlength {
 				copy(buf[boffset:remaining], data[doffset:doffset+remaining])
 				doffset += remaining
@@ -507,15 +508,15 @@ func (vc *VolumeContext) UnmapBlock(block uint64) error {
 func (vc *VolumeContext) UnmapAt(data []byte, offset uint64) error {
 	doffset := uint64(0)
 	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data)) - doffset {
-		block := (offset + doffset) / 512
-		boffset := (offset + doffset) % 512
-		if boffset == 0 && remaining >= 512 {
+		block := (offset + doffset) / BLOCK_SIZE
+		boffset := (offset + doffset) % BLOCK_SIZE
+		if boffset == 0 && remaining >= BLOCK_SIZE {
 			if err := vc.UnmapBlock(block); err != nil {
 				return err
 			}
-			doffset += 512
+			doffset += BLOCK_SIZE
 		} else {
-			dlength := 512 - boffset
+			dlength := BLOCK_SIZE - boffset
 			if remaining < dlength {
 				doffset += remaining
 			} else {
