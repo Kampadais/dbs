@@ -505,9 +505,9 @@ func (vc *VolumeContext) UnmapBlock(block uint64) error {
 	return nil
 }
 
-func (vc *VolumeContext) UnmapAt(data []byte, offset uint64) error {
+func (vc *VolumeContext) UnmapAt(length uint64, offset uint64) error {
 	doffset := uint64(0)
-	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data)) - doffset {
+	for remaining := length; remaining > 0; remaining = length - doffset {
 		block := (offset + doffset) / BLOCK_SIZE
 		boffset := (offset + doffset) % BLOCK_SIZE
 		if boffset == 0 && remaining >= BLOCK_SIZE {
