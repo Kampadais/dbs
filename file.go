@@ -2,6 +2,7 @@ package dbs
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/ncw/directio"
@@ -26,11 +27,11 @@ func NewDirectFile(name string, flag int, perm os.FileMode) (*DirectFile, error)
 }
 
 func (file *DirectFile) Size() (int64, error) {
-	stat, err := file.File.Stat()
+	pos, err := file.File.Seek(0, io.SeekEnd)
 	if err != nil {
-		return 0, fmt.Errorf("cannot stat %v: %w", file.Name, err)
+		return 0, fmt.Errorf("cannot seek in %v: %w", file.Name, err)
 	}
-	return stat.Size(), nil
+	return pos, nil
 }
 
 // Read using direct I/O
