@@ -1,2 +1,3 @@
-dbsctl
+cmd/dbsctl/dbsctl
+cmd/dbssrv/dbssrv
 *.img
