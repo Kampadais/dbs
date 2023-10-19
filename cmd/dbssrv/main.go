@@ -27,16 +27,32 @@ func NewNbdBackend(vc *dbs.VolumeContext, size uint64) *NbdBackend {
 	}
 }
 
-func (b *NbdBackend) ReadAt(p []byte, off int64) (n int, err error) {
+func (b *NbdBackend) ReadAt(p []byte, off int64) (int, error) {
 	b.RLock()
-	defer b.RUnlock()
-	return len(p), b.vc.ReadAt(p, uint64(off))
+	err := b.vc.ReadAt(p, uint64(off))
+	b.RUnlock()
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
-func (b *NbdBackend) WriteAt(p []byte, off int64) (n int, err error) {
-	b.Lock()
-	defer b.Unlock()
-	return len(p), b.vc.WriteAt(p, uint64(off))
+func (b *NbdBackend) WriteAt(p []byte, off int64) (int, error) {
+	b.RLock()
+	err := b.vc.WriteAt(p, uint64(off), false)
+	b.RUnlock()
+	if err != nil {
+		if err != dbs.ErrMetadataNeedsUpdate {
+			return 0, err
+		}
+		b.Lock()
+		err = b.vc.WriteAt(p, uint64(off), true)
+		b.Unlock()
+		if err != nil {
+			return 0, err
+		}
+	}
+	return len(p), nil
 }
 
 func (b *NbdBackend) Size() (int64, error) {

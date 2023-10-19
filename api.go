@@ -10,6 +10,7 @@ package dbs
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"time"
 
@@ -410,7 +411,9 @@ func (vc *VolumeContext) ReadAt(data []byte, offset uint64) error {
 	return nil
 }
 
-func (vc *VolumeContext) WriteBlock(data []byte, block uint64) error {
+var ErrMetadataNeedsUpdate = errors.New("metadata needs update")
+
+func (vc *VolumeContext) WriteBlock(data []byte, block uint64, updateMetadata bool) error {
 	eidx := uint(block >> BLOCK_BITS_IN_EXTENT)
 	if eidx > vc.vem.totalVolumeExtents {
 		return fmt.Errorf("block offset out of bounds")
@@ -420,6 +423,9 @@ func (vc *VolumeContext) WriteBlock(data []byte, block uint64) error {
 	bb := bitmap.FromBytes(e.BlockBitmap[:])
 	// Unallocated or previous snapshot extent
 	if e.SnapshotId != vc.volume.SnapshotId {
+		if !updateMetadata {
+			return ErrMetadataNeedsUpdate
+		}
 		// Allocate new extent
 		if e.SnapshotId == 0 {
 			if err := vc.vem.NewExtentToSnapshot(uint32(eidx), vc.volume.SnapshotId); err != nil {
@@ -433,6 +439,10 @@ func (vc *VolumeContext) WriteBlock(data []byte, block uint64) error {
 		// Update allocation count
 		if err := vc.dc.WriteSuperblock(); err != nil {
 			return err
+		}
+	} else {
+		if !bb.Contains(uint32(bidx)) && !updateMetadata {
+			return ErrMetadataNeedsUpdate
 		}
 	}
 	// Write data to device
@@ -450,13 +460,13 @@ func (vc *VolumeContext) WriteBlock(data []byte, block uint64) error {
 	return nil
 }
 
-func (vc *VolumeContext) WriteAt(data []byte, offset uint64) error {
+func (vc *VolumeContext) WriteAt(data []byte, offset uint64, updateMetadata bool) error {
 	doffset := uint64(0)
 	for remaining := uint64(len(data)); remaining > 0; remaining = uint64(len(data)) - doffset {
 		block := (offset + doffset) / BLOCK_SIZE
 		boffset := (offset + doffset) % BLOCK_SIZE
 		if boffset == 0 && remaining >= BLOCK_SIZE {
-			if err := vc.WriteBlock(data[doffset:], block); err != nil {
+			if err := vc.WriteBlock(data[doffset:], block, updateMetadata); err != nil {
 				return err
 			}
 			doffset += BLOCK_SIZE
@@ -473,7 +483,7 @@ func (vc *VolumeContext) WriteAt(data []byte, offset uint64) error {
 				copy(buf[boffset:dlength], data[doffset:doffset+dlength])
 				doffset += dlength
 			}
-			if err := vc.WriteBlock(buf, block); err != nil {
+			if err := vc.WriteBlock(buf, block, updateMetadata); err != nil {
 				return err
 			}
 		}
