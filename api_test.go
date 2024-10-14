@@ -310,7 +310,7 @@ func readBlocks(c *C, vc *VolumeContext, blockIndices []int, blockData [][]byte)
 func writeBlocks(c *C, vc *VolumeContext, blockIndices []int, blockData [][]byte) {
 	blockCount := len(blockData)
 	for i, _ := range blockIndices {
-		err := vc.WriteBlock(blockData[i%blockCount], uint64(blockIndices[i]))
+		err := vc.WriteBlock(blockData[i%blockCount], uint64(blockIndices[i]), true)
 		c.Assert(err, IsNil)
 	}
 }
