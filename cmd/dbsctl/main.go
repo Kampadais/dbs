@@ -24,7 +24,7 @@ import (
 	"github.com/jawher/mow.cli"
 	"github.com/jedib0t/go-pretty/v6/table"
 
-	"github.com/chazapis/dbs"
+	"github.com/CARV-ICS-FORTH/dbs"
 )
 
 var device *string

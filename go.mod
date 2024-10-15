@@ -1,4 +1,4 @@
-module github.com/chazapis/dbs
+module github.com/CARV-ICS-FORTH/dbs
 
 go 1.21
 

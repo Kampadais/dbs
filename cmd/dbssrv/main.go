@@ -25,7 +25,7 @@ import (
 	"golang.org/x/exp/slices"
 	nbd "github.com/chazapis/go-nbd/pkg/server"
 
-	"github.com/chazapis/dbs"
+	"github.com/CARV-ICS-FORTH/dbs"
 )
 
 type NbdBackend struct {
