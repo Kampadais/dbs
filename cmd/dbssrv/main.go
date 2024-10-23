@@ -21,11 +21,11 @@ import (
 	"os"
 	"sync"
 
+	nbd "github.com/chazapis/go-nbd/pkg/server"
 	"github.com/jawher/mow.cli"
 	"golang.org/x/exp/slices"
-	nbd "github.com/chazapis/go-nbd/pkg/server"
 
-	"github.com/CARV-ICS-FORTH/dbs"
+	"github.com/Kampadais/dbs"
 )
 
 type NbdBackend struct {
