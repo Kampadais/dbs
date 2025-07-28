@@ -413,10 +413,10 @@ func (vc *VolumeContext) ReadAt(data []byte, offset uint64) error {
 			}
 			dlength := BLOCK_SIZE - boffset
 			if remaining < dlength {
-				copy(data[doffset:doffset+remaining], buf[boffset:remaining])
+				copy(data[doffset:doffset+remaining], buf[boffset:boffset+remaining])
 				doffset += remaining
 			} else {
-				copy(data[doffset:doffset+dlength], buf[boffset:dlength])
+				copy(data[doffset:doffset+dlength], buf[boffset:boffset+dlength])
 				doffset += dlength
 			}
 		}
@@ -481,10 +481,10 @@ func (vc *VolumeContext) WriteAt(data []byte, offset uint64) error {
 			}
 			dlength := BLOCK_SIZE - boffset
 			if remaining < dlength {
-				copy(buf[boffset:remaining], data[doffset:doffset+remaining])
+				copy(buf[boffset:boffset+remaining], data[doffset:doffset+remaining])
 				doffset += remaining
 			} else {
-				copy(buf[boffset:dlength], data[doffset:doffset+dlength])
+				copy(buf[boffset:boffset+dlength], data[doffset:doffset+dlength])
 				doffset += dlength
 			}
 			if err := vc.WriteBlock(buf, block); err != nil {
