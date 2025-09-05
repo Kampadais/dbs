@@ -402,7 +402,7 @@ func (vc *VolumeContext) ReadAt(data []byte, offset uint64) error {
 		block := (offset + doffset) / BLOCK_SIZE
 		boffset := (offset + doffset) % BLOCK_SIZE
 		if boffset == 0 && remaining >= BLOCK_SIZE {
-			if err := vc.ReadBlock(data[doffset:], block); err != nil {
+			if err := vc.ReadBlock(data[doffset:doffset+BLOCK_SIZE], block); err != nil {
 				return err
 			}
 			doffset += BLOCK_SIZE
@@ -470,7 +470,7 @@ func (vc *VolumeContext) WriteAt(data []byte, offset uint64) error {
 		block := (offset + doffset) / BLOCK_SIZE
 		boffset := (offset + doffset) % BLOCK_SIZE
 		if boffset == 0 && remaining >= BLOCK_SIZE {
-			if err := vc.WriteBlock(data[doffset:], block); err != nil {
+			if err := vc.WriteBlock(data[doffset:doffset+BLOCK_SIZE], block); err != nil {
 				return err
 			}
 			doffset += BLOCK_SIZE
