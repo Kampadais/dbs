@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/kelindar/bitmap"
@@ -62,6 +63,9 @@ type VolumeMetadata struct {
 type SnapshotMetadata struct {
 	ParentSnapshotId uint16
 	CreatedAt        int64
+	UserCreated      bool
+	Size             uint64
+	Labels           map[string]string
 }
 
 type ExtentMetadata struct {
@@ -96,7 +100,9 @@ type VolumeInfo struct {
 type SnapshotInfo struct {
 	SnapshotId       uint
 	ParentSnapshotId uint
+	UserCreated      bool
 	CreatedAt        time.Time
+	Labels           map[string]string
 }
 
 func humanVersion(version uint32) string {
@@ -157,6 +163,8 @@ func GetSnapshotInfo(device string, volumeName string) ([]SnapshotInfo, error) {
 		si[siidx].SnapshotId = uint(sid)
 		si[siidx].ParentSnapshotId = uint(dc.snapshots[sid-1].ParentSnapshotId)
 		si[siidx].CreatedAt = time.Unix(dc.snapshots[sid-1].CreatedAt, 0)
+		si[siidx].UserCreated = dc.snapshots[sid-1].UserCreated
+		si[siidx].Labels = dc.snapshots[sid-1].Labels
 		siidx++
 	}
 	dc.Close()
@@ -226,7 +234,7 @@ func RenameVolume(device string, volumeName string, newVolumeName string) error 
 	return dc.Close()
 }
 
-func CreateSnapshot(device string, volumeName string) error {
+func CreateSnapshot(device string, volumeName string, userMade bool, createdTime string, labels map[string]string) error {
 	dc, err := GetDeviceContext(device)
 	if err != nil {
 		return err
@@ -235,7 +243,7 @@ func CreateSnapshot(device string, volumeName string) error {
 	if v == nil {
 		return fmt.Errorf("volume %v not found", volumeName)
 	}
-	sid, err := dc.AddSnapshot(v.SnapshotId)
+	sid, err := dc.AddSnapshot(v.SnapshotId, userMade, createdTime, labels)
 	if err != nil {
 		return err
 	}
@@ -549,4 +557,30 @@ func (vc *VolumeContext) UnmapAt(length uint64, offset uint64) error {
 		}
 	}
 	return nil
+}
+
+func (vc *VolumeContext) SnapshotsSize() map[string]uint64 {
+	sizeMap := make(map[string]uint64)
+
+	if vc == nil {
+		return sizeMap
+
+	}
+	for sid := vc.volume.SnapshotId; sid > 0; sid = vc.dc.snapshots[sid-1].ParentSnapshotId {
+		sem, err := GetSnapshotExtentMap(vc.dc, vc.volume.VolumeSize, sid)
+		if err != nil {
+			return sizeMap
+		}
+		var totalSize uint64 = 0
+		sem.extentBitmap.Range(func(x uint32) {
+			e := sem.extents[x]
+			bb := bitmap.FromBytes(e.BlockBitmap[:])
+			totalSize += uint64(bb.Count()) * BLOCK_SIZE
+		})
+		snapshotName := strconv.Itoa(int(sid))
+		sizeMap[snapshotName] = totalSize
+	}
+
+	return sizeMap
+
 }
