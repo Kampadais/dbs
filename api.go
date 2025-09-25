@@ -175,7 +175,7 @@ func GetSnapshotInfo(device string, volumeName string) ([]SnapshotInfo, error) {
 			}
 
 		}
-		si[siidx].Size = dc.SnapshotsSize(v)
+		si[siidx].Size = dc.SnapshotsSize(v, sid)
 
 		siidx++
 	}
@@ -577,12 +577,9 @@ func (vc *VolumeContext) UnmapAt(length uint64, offset uint64) error {
 	return nil
 }
 
-func (dc *DeviceContext) SnapshotsSize(vm *VolumeMetadata) uint64 {
-	if vm.SnapshotId == 0 {
-		return 0
-	}
+func (dc *DeviceContext) SnapshotsSize(vm *VolumeMetadata, sid uint16) uint64 {
 
-	sem, err := GetSnapshotExtentMap(dc, vm.VolumeSize, vm.SnapshotId)
+	sem, err := GetSnapshotExtentMap(dc, vm.VolumeSize, sid)
 	if err != nil {
 		return 0
 	}
