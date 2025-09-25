@@ -89,7 +89,7 @@ func cmdGetSnapshotInfo(cmd *cli.Cmd) {
 
 		t := table.NewWriter()
 		t.SetOutputMirror(os.Stdout)
-		t.AppendRow(table.Row{"snapshot_id", "parent_snapshot_id", "created_at", "labels"})
+		t.AppendRow(table.Row{"snapshot_id", "parent_snapshot_id", "created_at", "size", "labels"})
 		t.AppendSeparator()
 		for i := range si {
 			psid := strconv.Itoa(int(si[i].ParentSnapshotId))
@@ -112,6 +112,7 @@ func cmdGetSnapshotInfo(cmd *cli.Cmd) {
 				si[i].SnapshotId,
 				psid,
 				si[i].CreatedAt,
+				si[i].Size,
 				labelStr,
 			})
 		}

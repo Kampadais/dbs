@@ -26,7 +26,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/kelindar/bitmap"
@@ -106,6 +105,7 @@ type SnapshotInfo struct {
 	ParentSnapshotId uint
 	UserCreated      bool
 	CreatedAt        time.Time
+	Size             uint64
 	Labels           map[string]string
 }
 
@@ -168,7 +168,6 @@ func GetSnapshotInfo(device string, volumeName string) ([]SnapshotInfo, error) {
 		si[siidx].ParentSnapshotId = uint(dc.snapshots[sid-1].ParentSnapshotId)
 		si[siidx].CreatedAt = time.Unix(dc.snapshots[sid-1].CreatedAt, 0)
 		si[siidx].UserCreated = dc.snapshots[sid-1].UserCreated
-		//si[siidx].Labels = dc.snapshots[sid-1].Labels
 		for _, l := range dc.labels {
 			if l.Sid == sid {
 				si[siidx].Labels = l.Labels
@@ -176,6 +175,8 @@ func GetSnapshotInfo(device string, volumeName string) ([]SnapshotInfo, error) {
 			}
 
 		}
+		si[siidx].Size = dc.SnapshotsSize(v)
+
 		siidx++
 	}
 	dc.Close()
@@ -576,28 +577,22 @@ func (vc *VolumeContext) UnmapAt(length uint64, offset uint64) error {
 	return nil
 }
 
-func (vc *VolumeContext) SnapshotsSize() map[string]uint64 {
-	sizeMap := make(map[string]uint64)
-
-	if vc == nil {
-		return sizeMap
-
-	}
-	for sid := vc.volume.SnapshotId; sid > 0; sid = vc.dc.snapshots[sid-1].ParentSnapshotId {
-		sem, err := GetSnapshotExtentMap(vc.dc, vc.volume.VolumeSize, sid)
-		if err != nil {
-			return sizeMap
-		}
-		var totalSize uint64 = 0
-		sem.extentBitmap.Range(func(x uint32) {
-			e := sem.extents[x]
-			bb := bitmap.FromBytes(e.BlockBitmap[:])
-			totalSize += uint64(bb.Count()) * BLOCK_SIZE
-		})
-		snapshotName := strconv.Itoa(int(sid))
-		sizeMap[snapshotName] = totalSize
+func (dc *DeviceContext) SnapshotsSize(vm *VolumeMetadata) uint64 {
+	if vm.SnapshotId == 0 {
+		return 0
 	}
 
-	return sizeMap
+	sem, err := GetSnapshotExtentMap(dc, vm.VolumeSize, vm.SnapshotId)
+	if err != nil {
+		return 0
+	}
+	var totalSize uint64 = 0
+	sem.extentBitmap.Range(func(x uint32) {
+		e := sem.extents[x]
+		bb := bitmap.FromBytes(e.BlockBitmap[:])
+		totalSize += uint64(bb.Count()) * BLOCK_SIZE
+	})
+
+	return totalSize
 
 }
