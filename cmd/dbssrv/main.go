@@ -48,9 +48,25 @@ func (b *NbdBackend) ReadAt(p []byte, off int64) (n int, err error) {
 }
 
 func (b *NbdBackend) WriteAt(p []byte, off int64) (n int, err error) {
-	b.Lock()
-	defer b.Unlock()
-	return len(p), b.vc.WriteAt(p, uint64(off))
+	if b.vc == nil {
+		return 0, fmt.Errorf("replica no longer exists")
+	}
+
+	// Try with a read lock and upgrade to a write lock if necessary
+	b.RLock()
+	err = b.vc.WriteAt(p, uint64(off), false)
+	if err != nil {
+		b.RUnlock()
+		b.Lock()
+		err := b.vc.WriteAt(p, uint64(off), true)
+		if err != nil {
+			return 0, err
+		}
+		b.Unlock()
+		return len(p), nil
+	}
+	b.RUnlock()
+	return len(p), err
 }
 
 func (b *NbdBackend) Size() (int64, error) {

@@ -18,7 +18,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/docker/go-units"
 	"github.com/jawher/mow.cli"
@@ -86,17 +89,30 @@ func cmdGetSnapshotInfo(cmd *cli.Cmd) {
 
 		t := table.NewWriter()
 		t.SetOutputMirror(os.Stdout)
-		t.AppendRow(table.Row{"snapshot_id", "parent_snapshot_id", "created_at"})
+		t.AppendRow(table.Row{"snapshot_id", "parent_snapshot_id", "created_at", "labels"})
 		t.AppendSeparator()
 		for i := range si {
 			psid := strconv.Itoa(int(si[i].ParentSnapshotId))
 			if psid == "0" {
 				psid = "-"
 			}
+			var labelStr string
+			if len(si[i].Labels) == 0 {
+				labelStr = "-" // no labels
+			} else {
+				pairs := make([]string, 0, len(si[i].Labels))
+				for k, v := range si[i].Labels {
+					pairs = append(pairs, fmt.Sprintf("%s=%s", k, v))
+				}
+				sort.Strings(pairs) // optional, for stable output
+				labelStr = strings.Join(pairs, ", ")
+			}
+
 			t.AppendRow(table.Row{
 				si[i].SnapshotId,
 				psid,
 				si[i].CreatedAt,
+				labelStr,
 			})
 		}
 		t.Render()
@@ -145,9 +161,28 @@ func cmdRenameVolume(cmd *cli.Cmd) {
 }
 
 func cmdCreateSnapshot(cmd *cli.Cmd) {
+	cmd.Spec = "VOLUME_NAME [LABELS...]"
 	volumeName := cmd.StringArg("VOLUME_NAME", "", "")
+	labelArgs := cmd.StringsArg("LABELS", nil, "Labels to attach to the snapshot in key=value format")
+
 	cmd.Action = func() {
-		if err := dbs.CreateSnapshot(*device, *volumeName); err != nil {
+		labels := make(map[string]string)
+
+		// Only parse if user supplied labels
+		if labelArgs != nil {
+			for _, arg := range *labelArgs {
+				parts := strings.SplitN(arg, "=", 2)
+				if len(parts) != 2 {
+					fmt.Printf("invalid label format: %q (expected key=value)\n", arg)
+					os.Exit(1)
+				}
+				key := strings.TrimSpace(parts[0])
+				val := strings.TrimSpace(parts[1])
+				labels[key] = val
+			}
+		}
+
+		if err := dbs.CreateSnapshot(*device, *volumeName, true, time.Now().Format(time.RFC3339), labels); err != nil {
 			fmt.Println(err)
 		}
 	}

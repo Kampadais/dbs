@@ -38,6 +38,7 @@ type DeviceContext struct {
 	superblock         *Superblock
 	volumes            [MAX_VOLUMES]VolumeMetadata
 	snapshots          [MAX_SNAPSHOTS]SnapshotMetadata
+	labels             []LabelMetadata
 	extentOffset       uint
 	totalDeviceExtents uint
 	dataOffset         uint
@@ -123,72 +124,55 @@ func (dc *DeviceContext) ReadMetadata() error {
 	if err := binary.Read(buf, binary.LittleEndian, dc.volumes[:]); err != nil {
 		return fmt.Errorf("failed to deserialize volume metadata: %w", err)
 	}
-	var snapshotCount uint32
-	if err := binary.Read(buf, binary.LittleEndian, &snapshotCount); err != nil {
-		return fmt.Errorf("failed to deserialize snapshot count: %w", err)
+	if err := binary.Read(buf, binary.LittleEndian, dc.snapshots[:]); err != nil {
+		return fmt.Errorf("failed to deserialize snapshot metadata: %w", err)
 	}
 
-	dc.snapshots = [MAX_SNAPSHOTS]SnapshotMetadata{}
-
-	for i := uint32(0); i < snapshotCount; i++ {
-		sm, err := readSnapshotMetadata(buf)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize snapshot metadata: %w", err)
-		}
-		dc.snapshots[i] = sm
-	}
-	return nil
-}
-
-func readSnapshotMetadata(r *bytes.Buffer) (SnapshotMetadata, error) {
-	var sm SnapshotMetadata
-
-	// Read fixed fields
-	if err := binary.Read(r, binary.LittleEndian, &sm.ParentSnapshotId); err != nil {
-		return sm, err
-	}
-	if err := binary.Read(r, binary.LittleEndian, &sm.CreatedAt); err != nil {
-		return sm, err
-	}
-	if err := binary.Read(r, binary.LittleEndian, &sm.UserCreated); err != nil {
-		return sm, err
-	}
-
-	// Read labels count
 	var labelCount uint32
-	if err := binary.Read(r, binary.LittleEndian, &labelCount); err != nil {
-		return sm, err
+	if err := binary.Read(buf, binary.LittleEndian, &labelCount); err != nil {
+		return fmt.Errorf("failed to deserialize label count: %w", err)
 	}
 
-	sm.Labels = make(map[string]string, labelCount)
-
-	// Read each key/value
+	dc.labels = make([]LabelMetadata, 0, labelCount)
 	for i := uint32(0); i < labelCount; i++ {
-		k, err := readString(r)
-		if err != nil {
-			return sm, err
+		var sid uint16
+		if err := binary.Read(buf, binary.LittleEndian, &sid); err != nil {
+			return fmt.Errorf("failed to deserialize label snapshot id: %w", err)
 		}
-		v, err := readString(r)
-		if err != nil {
-			return sm, err
+
+		var kvCount uint32
+		if err := binary.Read(buf, binary.LittleEndian, &kvCount); err != nil {
+			return fmt.Errorf("failed to deserialize label kv count: %w", err)
 		}
-		sm.Labels[k] = v
+
+		labels := make(map[string]string)
+		for j := uint32(0); j < kvCount; j++ {
+			var klen uint32
+			if err := binary.Read(buf, binary.LittleEndian, &klen); err != nil {
+				return fmt.Errorf("failed to deserialize label key length: %w", err)
+			}
+			kbuf := make([]byte, klen)
+			if _, err := buf.Read(kbuf); err != nil {
+				return fmt.Errorf("failed to read label key: %w", err)
+			}
+			var vlen uint32
+			if err := binary.Read(buf, binary.LittleEndian, &vlen); err != nil {
+				return fmt.Errorf("failed to deserialize label value length: %w", err)
+			}
+			vbuf := make([]byte, vlen)
+			if _, err := buf.Read(vbuf); err != nil {
+				return fmt.Errorf("failed to read label value: %w", err)
+			}
+			labels[string(kbuf)] = string(vbuf)
+		}
+
+		dc.labels = append(dc.labels, LabelMetadata{
+			Sid:    sid,
+			Labels: labels,
+		})
 	}
 
-	return sm, nil
-}
-
-func readString(r *bytes.Buffer) (string, error) {
-	var length uint32
-	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
-		return "", err
-	}
-
-	b := r.Next(int(length)) // safe because bytes.Buffer tracks remaining length
-	if len(b) != int(length) {
-		return "", fmt.Errorf("unexpected end of buffer while reading string")
-	}
-	return string(b), nil
+	return nil
 }
 
 func (dc *DeviceContext) ReadExtents(eb []ExtentMetadata, eidx uint) error {
@@ -232,62 +216,40 @@ func (dc *DeviceContext) WriteMetadata() error {
 	if err := binary.Write(buf, binary.LittleEndian, dc.volumes); err != nil {
 		return fmt.Errorf("failed to serialize volume metadata: %w", err)
 	}
-	var snapshotCount uint32
-	for i := 0; i < MAX_SNAPSHOTS; i++ {
-		sm := dc.snapshots[i]
-		if sm.CreatedAt != 0 {
-			snapshotCount++
-		}
+	if err := binary.Write(buf, binary.LittleEndian, dc.snapshots); err != nil {
+		return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
 	}
 
-	if err := binary.Write(buf, binary.LittleEndian, snapshotCount); err != nil {
-		return fmt.Errorf("failed to serialize snapshot count: %w", err)
+	if err := binary.Write(buf, binary.LittleEndian, uint32(len(dc.labels))); err != nil {
+		return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
 	}
-	for _, sm := range dc.snapshots {
-		if sm.CreatedAt == 0 {
-			continue
-		}
-		if err := writeSnapshotMetadata(buf, sm); err != nil {
+	for _, l := range dc.labels {
+		if err := binary.Write(buf, binary.LittleEndian, l.Sid); err != nil {
 			return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
 		}
+
+		if err := binary.Write(buf, binary.LittleEndian, uint32(len(l.Labels))); err != nil {
+			return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
+		}
+		for k, v := range l.Labels {
+			if err := writeString(buf, k); err != nil {
+				return fmt.Errorf("failed to serialize label key: %w", err)
+			}
+			if err := writeString(buf, v); err != nil {
+				return fmt.Errorf("failed to serialize label value: %w", err)
+			}
+		}
+
 	}
+
 	abuf := directio.AlignedBlock(int(dc.extentOffset - BLOCK_SIZE))
 	copy(abuf[0:], buf.Bytes())
 	if _, err := dc.f.WriteAt(abuf, BLOCK_SIZE); err != nil {
 		return fmt.Errorf("failed to write metadata: %w", err)
 	}
+
 	return nil
 }
-
-func writeSnapshotMetadata(w *bytes.Buffer, sm SnapshotMetadata) error {
-	// Write fixed fields
-	if err := binary.Write(w, binary.LittleEndian, sm.ParentSnapshotId); err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, sm.CreatedAt); err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, sm.UserCreated); err != nil {
-		return err
-	}
-
-	// Write labels count
-	if err := binary.Write(w, binary.LittleEndian, uint32(len(sm.Labels))); err != nil {
-		return err
-	}
-
-	// Write each label (length + string data)
-	for k, v := range sm.Labels {
-		if err := writeString(w, k); err != nil {
-			return err
-		}
-		if err := writeString(w, v); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func writeString(w *bytes.Buffer, s string) error {
 	if err := binary.Write(w, binary.LittleEndian, uint32(len(s))); err != nil {
 		return err
@@ -437,10 +399,14 @@ func (dc *DeviceContext) AddSnapshot(parentSnapshotId uint16, userMade bool, cre
 	dc.snapshots[sidx].CreatedAt = unixTime
 	dc.snapshots[sidx].UserCreated = userMade
 	if len(labels) > 0 {
-		dc.snapshots[sidx].Labels = make(map[string]string)
+		lab := make(map[string]string)
 		for k, v := range labels {
-			dc.snapshots[sidx].Labels[k] = v
+			lab[k] = v
 		}
+		dc.labels = append(dc.labels, LabelMetadata{
+			Sid:    uint16(sidx) + 1,
+			Labels: lab,
+		})
 	}
 
 	return uint16(sidx) + 1, nil

@@ -153,7 +153,11 @@ func (s *TestSuite) TestSnapshot(c *C) {
 	c.Assert(volumeSnapshotId, Equals, initialSnapshotId)
 
 	// Create a snapshot
-	err = CreateSnapshot(DEVICE, "vol1")
+	labels := map[string]string{
+		"snap1": "first",
+	}
+
+	err = CreateSnapshot(DEVICE, "vol1", true, time.Now().Format(time.RFC3339), labels)
 	c.Assert(err, IsNil)
 	volumeInfo, err = GetVolumeInfo(DEVICE)
 	c.Assert(err, IsNil)
@@ -179,12 +183,18 @@ func (s *TestSuite) TestSnapshot(c *C) {
 	c.Assert(currentSnapshot.SnapshotId, Equals, volumeSnapshotId)
 	c.Assert(currentSnapshot.ParentSnapshotId, Equals, initialSnapshotId)
 
-	// Create multiple snapshots
-	err = CreateSnapshot(DEVICE, "vol1")
+	err = CreateSnapshot(DEVICE, "vol1", true, time.Now().Format(time.RFC3339), labels)
 	c.Assert(err, IsNil)
-	err = CreateSnapshot(DEVICE, "vol1")
+	labels = map[string]string{
+		"snap3": "third",
+		"foo":   "bar",
+	}
+	err = CreateSnapshot(DEVICE, "vol1", true, time.Now().Format(time.RFC3339), nil)
 	c.Assert(err, IsNil)
-	err = CreateSnapshot(DEVICE, "vol1")
+	labels = map[string]string{
+		"snap4": "fourth",
+	}
+	err = CreateSnapshot(DEVICE, "vol1", true, time.Now().Format(time.RFC3339), labels)
 	c.Assert(err, IsNil)
 	volumeInfo, err = GetVolumeInfo(DEVICE)
 	c.Assert(err, IsNil)
@@ -225,7 +235,10 @@ func (s *TestSuite) TestSnapshot(c *C) {
 	c.Assert(snapshotInfo, HasLen, 4)
 
 	// Create snapshot again
-	err = CreateSnapshot(DEVICE, "vol1")
+	labels = map[string]string{
+		"snap5": "fifth",
+	}
+	err = CreateSnapshot(DEVICE, "vol1", true, time.Now().Format(time.RFC3339), labels)
 	c.Assert(err, IsNil)
 	volumeInfo, err = GetVolumeInfo(DEVICE)
 	c.Assert(err, IsNil)
@@ -267,7 +280,7 @@ func (s *TestSuite) TestSnapshot(c *C) {
 	c.Assert(volumeInfo, HasLen, 1)
 
 	// Snapshot and clone both the previous snapshot and latest snapshot
-	err = CreateSnapshot(DEVICE, "vol1")
+	err = CreateSnapshot(DEVICE, "vol1", true, time.Now().Format(time.RFC3339), labels)
 	c.Assert(err, IsNil)
 	snapshotInfo, err = GetSnapshotInfo(DEVICE, "vol1")
 	c.Assert(err, IsNil)
@@ -415,7 +428,7 @@ func (s *TestSuite) TestSnapshotIO(c *C) {
 	vc.CloseVolume()
 
 	// Snapshot, open again and read back
-	err = CreateSnapshot(DEVICE, "vol1")
+	err = CreateSnapshot(DEVICE, "vol1", true, time.Now().Format(time.RFC3339), nil)
 	c.Assert(err, IsNil)
 	vc, err = OpenVolume(DEVICE, "vol1")
 	c.Assert(err, IsNil)

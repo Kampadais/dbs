@@ -65,7 +65,11 @@ type SnapshotMetadata struct {
 	CreatedAt        int64
 	UserCreated      bool
 	Size             uint64
-	Labels           map[string]string
+}
+
+type LabelMetadata struct {
+	Sid    uint16
+	Labels map[string]string
 }
 
 type ExtentMetadata struct {
@@ -164,7 +168,14 @@ func GetSnapshotInfo(device string, volumeName string) ([]SnapshotInfo, error) {
 		si[siidx].ParentSnapshotId = uint(dc.snapshots[sid-1].ParentSnapshotId)
 		si[siidx].CreatedAt = time.Unix(dc.snapshots[sid-1].CreatedAt, 0)
 		si[siidx].UserCreated = dc.snapshots[sid-1].UserCreated
-		si[siidx].Labels = dc.snapshots[sid-1].Labels
+		//si[siidx].Labels = dc.snapshots[sid-1].Labels
+		for _, l := range dc.labels {
+			if l.Sid == sid {
+				si[siidx].Labels = l.Labels
+				break
+			}
+
+		}
 		siidx++
 	}
 	dc.Close()
@@ -304,6 +315,12 @@ func DeleteVolume(device string, volumeName string) error {
 			return err
 		}
 		dc.snapshots[sid-1].CreatedAt = 0
+		for i, l := range dc.labels {
+			if l.Sid == sid-1 {
+				dc.labels[i] = LabelMetadata{}
+				break
+			}
+		}
 	}
 	*v = VolumeMetadata{}
 	if err := dc.WriteMetadata(); err != nil {
