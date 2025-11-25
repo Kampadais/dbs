@@ -48,6 +48,10 @@ func cmdGetDeviceInfo(cmd *cli.Cmd) {
 			{"total_device_extents", di.TotalDeviceExtents},
 			{"allocated_device_extents", di.AllocatedDeviceExtents},
 			{"volume_count", di.VolumeCount},
+			{"has_secondary_device", di.HasSecondaryDevice},
+			{"secondary_device_size", units.HumanSize(float64(di.SecondaryDeviceSize))},
+			{"allocated_secondary_device_extents", di.AllocatedSecondaryDeviceExtents},
+			{"secondary_device_name", di.SecondaryDeviceName},
 		})
 		t.Render()
 	}
@@ -121,8 +125,13 @@ func cmdGetSnapshotInfo(cmd *cli.Cmd) {
 }
 
 func cmdInitDevice(cmd *cli.Cmd) {
+	cmd.Spec = "[SECONDARY_DEVICE]"
+	secondaryDevice := cmd.StringArg("SECONDARY_DEVICE", "", "")
+
 	cmd.Action = func() {
-		if err := dbs.InitDevice(*device); err != nil {
+		fmt.Println("Initializing device:", *device, " secondary device:", *secondaryDevice)
+
+		if err := dbs.InitDevice(*device, *secondaryDevice); err != nil {
 			fmt.Println(err)
 		}
 	}
@@ -217,6 +226,18 @@ func cmdDeleteSnapshot(cmd *cli.Cmd) {
 	}
 }
 
+func cmdMigrateVolume(cmd *cli.Cmd) {
+	cmd.Spec = "VOLUME [POLICY]"
+	volume := cmd.StringArg("VOLUME", "", "")
+	policy := cmd.StringArg("POLICY", "", "")
+	cmd.Action = func() {
+		err := dbs.MigrateVolume(*device, *volume, *policy)
+		if err != nil {
+			fmt.Println("Error migrating volume:", err)
+		}
+	}
+}
+
 func main() {
 	app := cli.App("dbsctl", "DBS command line tool")
 	device = app.StringArg("DEVICE", "", "")
@@ -231,5 +252,6 @@ func main() {
 	app.Command("clone_snapshot", "", cmdCloneSnapshot)
 	app.Command("delete_volume", "", cmdDeleteVolume)
 	app.Command("delete_snapshot", "", cmdDeleteSnapshot)
+	app.Command("migrate_volume", "", cmdMigrateVolume)
 	app.Run(os.Args)
 }

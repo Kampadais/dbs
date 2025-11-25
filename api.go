@@ -44,13 +44,20 @@ const (
 	EXTENT_BITMAP_SIZE   = 32
 	BLOCK_BITS_IN_EXTENT = 8
 	BLOCK_MASK_IN_EXTENT = 0xFF
+
+	PRIMARY_DEVICE   = 0
+	SECONDARY_DEVICE = 1
 )
 
 type Superblock struct {
-	Magic                  [8]byte
-	Version                uint32 // 16-bit major, 8-bit minor, 8-bit patch
-	AllocatedDeviceExtents uint32
-	DeviceSize             uint64
+	Magic                     [8]byte
+	Version                   uint32 // 16-bit major, 8-bit minor, 8-bit patch
+	AllocatedDeviceExtents    uint32
+	DeviceSize                uint64
+	HasSecondaryDevice        uint8
+	AllocatedSecondaryExtents uint32
+	SecondarySize             uint64
+	SecondaryDevicePath       [256]byte
 }
 
 type VolumeMetadata struct {
@@ -72,9 +79,10 @@ type LabelMetadata struct {
 }
 
 type ExtentMetadata struct {
-	SnapshotId  uint16
-	ExtentPos   uint32
-	BlockBitmap [EXTENT_BITMAP_SIZE]byte
+	SnapshotId     uint16
+	ExtentPos      uint32
+	BlockBitmap    [EXTENT_BITMAP_SIZE]byte
+	DeviceLocation uint8
 }
 
 func (v *VolumeMetadata) setName(volumeName string) {
@@ -85,11 +93,15 @@ func (v *VolumeMetadata) setName(volumeName string) {
 // Query API
 
 type DeviceInfo struct {
-	Version                string
-	DeviceSize             uint64
-	TotalDeviceExtents     uint
-	AllocatedDeviceExtents uint
-	VolumeCount            uint
+	Version                         string
+	DeviceSize                      uint64
+	TotalDeviceExtents              uint
+	AllocatedDeviceExtents          uint
+	VolumeCount                     uint
+	HasSecondaryDevice              bool
+	SecondaryDeviceSize             uint64
+	AllocatedSecondaryDeviceExtents uint //TODO
+	SecondaryDeviceName             string
 }
 
 type VolumeInfo struct {
@@ -124,6 +136,9 @@ func GetDeviceInfo(device string) (*DeviceInfo, error) {
 		TotalDeviceExtents:     dc.totalDeviceExtents,
 		AllocatedDeviceExtents: uint(dc.superblock.AllocatedDeviceExtents),
 		VolumeCount:            dc.CountVolumes(),
+		HasSecondaryDevice:     dc.superblock.HasSecondaryDevice == 1,
+		SecondaryDeviceSize:    dc.superblock.SecondarySize,
+		SecondaryDeviceName:    dc.secondary.Name,
 	}
 	dc.Close()
 	return di, nil
@@ -185,7 +200,7 @@ func GetSnapshotInfo(device string, volumeName string) ([]SnapshotInfo, error) {
 
 // Management API
 
-func InitDevice(device string) error {
+func InitDevice(device string, secondary string) error {
 	dc, err := NewDeviceContext(device)
 	if err != nil {
 		return err
@@ -197,6 +212,19 @@ func InitDevice(device string) error {
 			return err
 		}
 	}
+
+	if secondary != "" {
+		f, secSize, err := GetDeviceStats(secondary)
+		if err != nil {
+			return err
+		}
+		dc.superblock.HasSecondaryDevice = 1
+		dc.superblock.SecondarySize = uint64(secSize)
+		dc.superblock.AllocatedSecondaryExtents = 0
+		copy(dc.superblock.SecondaryDevicePath[:], secondary)
+		dc.secondary = f
+	}
+
 	if err := dc.WriteMetadata(); err != nil {
 		return err
 	}
@@ -416,8 +444,8 @@ func (vc *VolumeContext) ReadBlock(data []byte, block uint64) error {
 		copy(data, emptyBlock[:])
 		return nil
 	}
-	// Read data from device
-	if err := vc.dc.ReadBlockData(data, uint(e.ExtentPos), bidx); err != nil {
+
+	if err := vc.dc.ReadBlockData(data, uint(e.ExtentPos), bidx, e.DeviceLocation); err != nil {
 		return err
 	}
 	return nil

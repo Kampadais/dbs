@@ -15,6 +15,8 @@
 package dbs
 
 import (
+	"fmt"
+
 	"github.com/kelindar/bitmap"
 )
 
@@ -87,6 +89,10 @@ func (em *ExtentMap) WriteExtent(eidx uint32) error {
 	e := em.extents[eidx]
 	// Convert ExtentPos from position in device to position in volume
 	e.ExtentPos = eidx
+	if e.DeviceLocation == SECONDARY_DEVICE {
+		fmt.Println("Writing extent to secondary device :", eidx)
+		return em.dc.WriteExtentSeconary(&e, uint(em.extents[eidx].ExtentPos))
+	}
 	return em.dc.WriteExtent(&e, uint(em.extents[eidx].ExtentPos))
 }
 

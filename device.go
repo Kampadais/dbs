@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/ncw/directio"
@@ -34,31 +33,24 @@ func divRoundUp(x uint, y uint) uint {
 
 // The device context holds the device file descriptor and all metadata except extents.
 type DeviceContext struct {
-	f                  *DirectFile
-	superblock         *Superblock
-	volumes            [MAX_VOLUMES]VolumeMetadata
-	snapshots          [MAX_SNAPSHOTS]SnapshotMetadata
-	labels             []LabelMetadata
-	extentOffset       uint
-	totalDeviceExtents uint
-	dataOffset         uint
+	f                     *DirectFile
+	secondary             *DirectFile // Secondary device for tiered storage
+	superblock            *Superblock
+	volumes               [MAX_VOLUMES]VolumeMetadata
+	snapshots             [MAX_SNAPSHOTS]SnapshotMetadata
+	labels                []LabelMetadata
+	extentOffset          uint
+	totalDeviceExtents    uint
+	totalSecondaryExtents uint //TODO
+	dataOffset            uint
 }
 
 // Initialize a new, empty device context.
 func NewDeviceContext(device string) (*DeviceContext, error) {
-	f, err := NewDirectFile(device, os.O_RDWR, 0660)
+	f, deviceSize, err := GetDeviceStats(device)
+
 	if err != nil {
-		return nil, fmt.Errorf("cannot open %v: %w", device, err)
-	}
-	deviceSize, err := f.Size()
-	if err != nil {
-		return nil, err
-	}
-	if deviceSize == 0 {
-		return nil, fmt.Errorf("device with zero size")
-	}
-	if deviceSize < (100 * (1 << 20)) {
-		return nil, fmt.Errorf("device size less than 100 MB")
+		return nil, fmt.Errorf("cannot open device %s: %w", device, err)
 	}
 
 	dc := &DeviceContext{
@@ -89,6 +81,27 @@ func GetDeviceContext(device string) (*DeviceContext, error) {
 	if err := dc.ReadMetadata(); err != nil {
 		return nil, err
 	}
+
+	if dc.superblock.HasSecondaryDevice == 1 {
+		secondaryPath := string(dc.superblock.SecondaryDevicePath[:])
+		// Trim null bytes
+		for i, b := range dc.superblock.SecondaryDevicePath {
+			if b == 0 {
+				secondaryPath = string(dc.superblock.SecondaryDevicePath[:i])
+				break
+			}
+		}
+
+		sf, _, err := GetDeviceStats(secondaryPath)
+		if err != nil {
+			dc.f.Close()
+			return nil, fmt.Errorf("cannot open secondary device %s: %w", secondaryPath, err)
+		}
+
+		dc.secondary = sf
+		dc.secondary.Name = secondaryPath
+	}
+
 	return dc, nil
 }
 
@@ -190,11 +203,21 @@ func (dc *DeviceContext) ReadExtents(eb []ExtentMetadata, eidx uint) error {
 	return nil
 }
 
-func (dc *DeviceContext) ReadBlockData(data []byte, epos uint, bidx uint) error {
-	offset := uint64(dc.dataOffset + (epos * EXTENT_SIZE) + (bidx * BLOCK_SIZE))
-	if _, err := dc.f.ReadAt(data[0:BLOCK_SIZE], offset); err != nil {
-		return fmt.Errorf("failed to read block: %w", err)
+func (dc *DeviceContext) ReadBlockData(data []byte, epos uint, bidx uint, location uint8) error {
+	if location == PRIMARY_DEVICE {
+		fmt.Println("Reading block from primary device at extent pos ", epos, " block idx ", bidx)
+		offset := uint64(dc.dataOffset + (epos * EXTENT_SIZE) + (bidx * BLOCK_SIZE))
+		if _, err := dc.f.ReadAt(data[0:BLOCK_SIZE], offset); err != nil {
+			return fmt.Errorf("failed to read block: %w", err)
+		}
+	} else {
+		fmt.Println("Reading block from secondary device at extent pos ", epos, " block idx ", bidx)
+		offset := uint64((epos * EXTENT_SIZE) + (bidx * BLOCK_SIZE))
+		if _, err := dc.secondary.ReadAt(data[0:BLOCK_SIZE], offset); err != nil {
+			return fmt.Errorf("failed to read block from secondary device: %w", err)
+		}
 	}
+
 	return nil
 }
 
@@ -277,8 +300,33 @@ func (dc *DeviceContext) WriteExtents(eb []ExtentMetadata, eidx uint) error {
 	return nil
 }
 
+func (dc *DeviceContext) WriteSecondaryExtent(eb []ExtentMetadata, eidx uint) error {
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, eb); err != nil {
+		return fmt.Errorf("failed to serialize extent metadata: %w", err)
+	}
+	offset := uint64(dc.extentOffset + (eidx * SIZEOF_EXTENT_METADATA))
+	size := uint64(binary.Size(eb))
+	blocks := ((offset + size) / BLOCK_SIZE) - (offset / BLOCK_SIZE) + 1
+	abuf := directio.AlignedBlock(int(BLOCK_SIZE * blocks))
+	if _, err := dc.secondary.ReadAt(abuf, (offset/BLOCK_SIZE)*BLOCK_SIZE); err != nil {
+		return fmt.Errorf("failed to read extent metadata: %w", err)
+	}
+
+	copy(abuf[offset%BLOCK_SIZE:(offset%BLOCK_SIZE)+size], buf.Bytes())
+	if _, err := dc.secondary.WriteAt(abuf, (offset/BLOCK_SIZE)*BLOCK_SIZE); err != nil {
+		return fmt.Errorf("failed to write extent metadata: %w", err)
+	}
+	return nil
+}
+
 func (dc *DeviceContext) WriteExtent(e *ExtentMetadata, eidx uint) error {
 	return dc.WriteExtents([]ExtentMetadata{*e}, eidx)
+}
+
+func (dc *DeviceContext) WriteExtentSeconary(e *ExtentMetadata, eidx uint) error {
+	return dc.WriteSecondaryExtent([]ExtentMetadata{*e}, eidx)
 }
 
 func (dc *DeviceContext) WriteBlockData(data []byte, epos uint, bidx uint) error {
@@ -418,5 +466,35 @@ func (dc *DeviceContext) Close() error {
 		return fmt.Errorf("cannot sync device: %w", err)
 	}
 	dc.f.Close()
+
+	// Close secondary device if open
+	if dc.secondary != nil {
+		if err := dc.secondary.Sync(); err != nil {
+			return fmt.Errorf("cannot sync secondary device: %w", err)
+		}
+		dc.secondary.Close()
+	}
+
 	return nil
+}
+
+func (dc *DeviceContext) CopyExtentToSecondary(e *ExtentMetadata) error {
+	//Read extent data from primary device
+	abuf := directio.AlignedBlock(EXTENT_SIZE)
+	if _, err := dc.f.ReadAt(abuf, uint64(dc.dataOffset+(uint(e.ExtentPos)*EXTENT_SIZE))); err != nil {
+		return fmt.Errorf("failed to read extent data from primary device: %w", err)
+	}
+
+	e.DeviceLocation = SECONDARY_DEVICE
+	e.ExtentPos = dc.superblock.AllocatedSecondaryExtents
+	dc.superblock.AllocatedSecondaryExtents++
+
+	fmt.Println("Copying extent to secondary device at position ", e.ExtentPos)
+	//Write extent data to secondary device
+	if _, err := dc.secondary.WriteAt(abuf, uint64(uint(e.ExtentPos)*EXTENT_SIZE)); err != nil {
+		return fmt.Errorf("failed to write extent data to secondary device: %w", err)
+	}
+
+	return nil
+
 }

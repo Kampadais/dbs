@@ -30,12 +30,18 @@ const (
 	MEGABYTE = 1024 * 1024
 	GIGABYTE = MEGABYTE * 1024
 
-	DEVICE      = "test.img"
-	DEVICE_SIZE = MEGABYTE * 100
+	DEVICE                = "test.img"
+	DEVICE_SIZE           = MEGABYTE * 100
+	SECONDARY_DEVICE_PATH = "test_secondary.img"
+	SECONDARY_DEVICE_SIZE = MEGABYTE * 50
 )
 
 func Test(t *testing.T) {
-	InitDevice(DEVICE)
+	err := InitDevice(DEVICE, SECONDARY_DEVICE_PATH)
+	if err != nil {
+		fmt.Println("Failed to initialize device:", err)
+		return
+	}
 	TestingT(t)
 }
 
@@ -44,7 +50,7 @@ type TestSuite struct{}
 var _ = Suite(&TestSuite{})
 
 func (s *TestSuite) TestDevice(c *C) {
-	err := InitDevice(DEVICE)
+	err := InitDevice(DEVICE, SECONDARY_DEVICE_PATH)
 	c.Assert(err, IsNil)
 	deviceInfo, err := GetDeviceInfo(DEVICE)
 	c.Assert(err, IsNil)
@@ -478,4 +484,27 @@ func (s *TestSuite) TestSnapshotIO(c *C) {
 	c.Assert(err, IsNil)
 	err = DeleteVolume(DEVICE, "vol1clone")
 	c.Assert(err, IsNil)
+}
+
+func (s *TestSuite) TestMigration(c *C) {
+	//repeats := 10
+	//spread := 100
+	//positions := []int{0, 3, 43, 53, 92}
+	//
+	//blockData := loadBlocks()
+	//i := 0
+	//for r := 0; r < repeats; r++ {
+	//	for _, p := range positions {
+	//		blockIndices[i] = p + (r * spread)
+	//		i++
+	//	}
+	//}
+	//blockData = append(blockData, make([]byte, BLOCK_SIZE)) // for unmapped reads
+	//// Create a volume and open it
+	//err := CreateVolume(DEVICE, "vol1", GIGABYTE)
+	//c.Assert(err, IsNil)
+	//vc, err := OpenVolume(DEVICE, "vol1")
+	//c.Assert(err, IsNil)
+	//
+
 }
