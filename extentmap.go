@@ -55,6 +55,7 @@ func GetSnapshotExtentMap(dc *DeviceContext, deviceSize uint64, snapshotId uint1
 				sem.extents[eidx] = eb[i]
 				// Convert ExtentPos from position in volume to position in device
 				sem.extents[eidx].ExtentPos = uint32(offset + i)
+				sem.extents[eidx].DeviceLocation = eb[i].DeviceLocation
 			}
 		}
 	}
@@ -85,22 +86,20 @@ func GetVolumeExtentMap(dc *DeviceContext, deviceSize uint64, snapshotId uint16)
 }
 
 // Write extent metadata to the device.
-func (em *ExtentMap) WriteExtent(eidx uint32) error {
+func (em *ExtentMap) WriteExtent(eidx uint32, location uint8) error {
 	e := em.extents[eidx]
 	// Convert ExtentPos from position in device to position in volume
 	e.ExtentPos = eidx
-	if e.DeviceLocation == SECONDARY_DEVICE {
-		fmt.Println("Writing extent to secondary device :", eidx)
-		return em.dc.WriteExtentSeconary(&e, uint(em.extents[eidx].ExtentPos))
-	}
-	return em.dc.WriteExtent(&e, uint(em.extents[eidx].ExtentPos))
+	return em.dc.WriteExtent(&e, uint(em.extents[eidx].ExtentPos), location)
 }
 
 // Allocate a new extent into the map.
 func (em *ExtentMap) NewExtentToSnapshot(eidx uint32, snapshotId uint16) error {
+	fmt.Println("Allocating new extent ", eidx, " to snapshot ", snapshotId)
 	em.extents[eidx].SnapshotId = snapshotId
 	em.extents[eidx].ExtentPos = em.dc.superblock.AllocatedDeviceExtents
-	if err := em.WriteExtent(eidx); err != nil {
+	em.extents[eidx].DeviceLocation = PRIMARY_DEVICE
+	if err := em.WriteExtent(eidx, PRIMARY_DEVICE); err != nil {
 		return err
 	}
 	em.dc.superblock.AllocatedDeviceExtents++
@@ -116,7 +115,7 @@ func (em *ExtentMap) CopyExtentToSnapshot(eidx uint32, snapshotId uint16) error 
 	}
 	em.extents[eidx].SnapshotId = snapshotId
 	em.extents[eidx].ExtentPos = pdst
-	if err := em.WriteExtent(eidx); err != nil {
+	if err := em.WriteExtent(eidx, PRIMARY_DEVICE); err != nil {
 		return err
 	}
 	em.dc.superblock.AllocatedDeviceExtents++
@@ -160,7 +159,7 @@ func (em *ExtentMap) MergeAllInto(emdst *ExtentMap, snapshotId uint16) error {
 		e := em.extents[x]
 		// Convert ExtentPos from position in device to position in volume
 		e.ExtentPos = x
-		if err := em.dc.WriteExtent(&e, uint(em.extents[x].ExtentPos)); err != nil {
+		if err := em.dc.WriteExtent(&e, uint(em.extents[x].ExtentPos), PRIMARY_DEVICE); err != nil {
 			cbErr = err
 			return
 		}
@@ -180,7 +179,7 @@ func (em *ExtentMap) ClearAll() error {
 			return
 		}
 		eidx := em.extents[x].ExtentPos
-		if err := em.dc.WriteExtent(&e, uint(eidx)); err != nil {
+		if err := em.dc.WriteExtent(&e, uint(eidx), PRIMARY_DEVICE); err != nil {
 			cbErr = err
 			return
 		}

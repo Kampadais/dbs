@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	SIZEOF_EXTENT_METADATA = 6 + EXTENT_BITMAP_SIZE
+	SIZEOF_EXTENT_METADATA = 1 + 6 + EXTENT_BITMAP_SIZE
 )
 
 func divRoundUp(x uint, y uint) uint {
@@ -92,13 +92,14 @@ func GetDeviceContext(device string) (*DeviceContext, error) {
 			}
 		}
 
-		sf, _, err := GetDeviceStats(secondaryPath)
+		sf, size, err := GetDeviceStats(secondaryPath)
 		if err != nil {
 			dc.f.Close()
 			return nil, fmt.Errorf("cannot open secondary device %s: %w", secondaryPath, err)
 		}
 
 		dc.secondary = sf
+		dc.totalSecondaryExtents = uint((size) / EXTENT_SIZE)
 		dc.secondary.Name = secondaryPath
 	}
 
@@ -205,13 +206,11 @@ func (dc *DeviceContext) ReadExtents(eb []ExtentMetadata, eidx uint) error {
 
 func (dc *DeviceContext) ReadBlockData(data []byte, epos uint, bidx uint, location uint8) error {
 	if location == PRIMARY_DEVICE {
-		fmt.Println("Reading block from primary device at extent pos ", epos, " block idx ", bidx)
 		offset := uint64(dc.dataOffset + (epos * EXTENT_SIZE) + (bidx * BLOCK_SIZE))
 		if _, err := dc.f.ReadAt(data[0:BLOCK_SIZE], offset); err != nil {
 			return fmt.Errorf("failed to read block: %w", err)
 		}
 	} else {
-		fmt.Println("Reading block from secondary device at extent pos ", epos, " block idx ", bidx)
 		offset := uint64((epos * EXTENT_SIZE) + (bidx * BLOCK_SIZE))
 		if _, err := dc.secondary.ReadAt(data[0:BLOCK_SIZE], offset); err != nil {
 			return fmt.Errorf("failed to read block from secondary device: %w", err)
@@ -321,7 +320,8 @@ func (dc *DeviceContext) WriteSecondaryExtent(eb []ExtentMetadata, eidx uint) er
 	return nil
 }
 
-func (dc *DeviceContext) WriteExtent(e *ExtentMetadata, eidx uint) error {
+func (dc *DeviceContext) WriteExtent(e *ExtentMetadata, eidx uint, location uint8) error {
+	e.DeviceLocation = location
 	return dc.WriteExtents([]ExtentMetadata{*e}, eidx)
 }
 
@@ -497,4 +497,9 @@ func (dc *DeviceContext) CopyExtentToSecondary(e *ExtentMetadata) error {
 
 	return nil
 
+}
+
+func (dc *DeviceContext) Defragment() error {
+
+	return nil
 }

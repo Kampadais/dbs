@@ -45,8 +45,8 @@ const (
 	BLOCK_BITS_IN_EXTENT = 8
 	BLOCK_MASK_IN_EXTENT = 0xFF
 
-	PRIMARY_DEVICE   = 0
-	SECONDARY_DEVICE = 1
+	PRIMARY_DEVICE   = 1
+	SECONDARY_DEVICE = 2
 )
 
 type Superblock struct {
@@ -522,7 +522,7 @@ func (vc *VolumeContext) WriteBlock(data []byte, block uint64, updateMetadata bo
 		return nil
 	}
 	bb.Set(uint32(bidx))
-	if err := vc.vem.WriteExtent(uint32(eidx)); err != nil {
+	if err := vc.vem.WriteExtent(uint32(eidx), PRIMARY_DEVICE); err != nil {
 		return err
 	}
 	return nil
@@ -577,7 +577,7 @@ func (vc *VolumeContext) UnmapBlock(block uint64) error {
 		// Release if not used
 		e.SnapshotId = 0
 	}
-	if err := vc.vem.WriteExtent(uint32(eidx)); err != nil {
+	if err := vc.vem.WriteExtent(uint32(eidx), PRIMARY_DEVICE); err != nil {
 		return err
 	}
 	return nil

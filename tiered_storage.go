@@ -10,19 +10,20 @@ func MigrateVolume(device string, volume string, policy string) error {
 	if err != nil {
 		return err
 	}
-	vol := dc.FindVolume(volume)
-	if vol == nil {
-		return fmt.Errorf("volume %v not found", volume)
+	vol, err := OpenVolume(device, volume)
+
+	if err != nil {
+		return err
 	}
 
 	fmt.Printf("Starting storage migration for device: %s , volume : %s with policy %s\n", device, volume, policy)
 
 	mex, err := calculateMigratedExtents(policy, vol, dc)
 
-	if uint(dc.superblock.AllocatedSecondaryExtents)+uint(len(mex)*EXTENT_SIZE) > dc.totalSecondaryExtents {
+	if uint(dc.superblock.AllocatedSecondaryExtents)+uint(mex*EXTENT_SIZE) > dc.totalSecondaryExtents {
 		//return fmt.Errorf("no space left on device")
 		//TODO
-		fmt.Println("Sec storage size :", dc.totalSecondaryExtents, " Allocated sec extents :", dc.superblock.AllocatedSecondaryExtents, " Extents to migrate size :", len(mex))
+		fmt.Println("Sec storage size :", dc.totalSecondaryExtents, " Allocated sec extents :", dc.superblock.AllocatedSecondaryExtents, " Extents to migrate size :", mex)
 		fmt.Printf("Warning: not enough space on device for migration, proceeding anyway\n")
 	}
 
@@ -30,67 +31,49 @@ func MigrateVolume(device string, volume string, policy string) error {
 		return err
 	}
 
-	if len(mex) == 0 {
-		fmt.Printf("No extents to migrate for volume: %s\n", volume)
-		return nil
-	}
+	fmt.Printf("Number of extents to migrate: %d\n", mex)
 
-	fmt.Printf("Number of extents to migrate: %d\n", len(mex))
-
-	err = copyToSecondaryStorage(mex, dc)
+	err = dc.WriteMetadata()
 	if err != nil {
 		return err
 	}
 
-	dc.WriteMetadata()
-
-	fmt.Printf("Storage migration completed ")
+	fmt.Printf("Storage migration completed \n")
 
 	return nil
 }
 
-func copyToSecondaryStorage(mex []ExtentMetadata, dc *DeviceContext) error {
-
-	for i, extent := range mex {
-		fmt.Printf("Migrating extent %d : ExtentPos %d , SnapshotId %d , DeviceLocation %d \n", i, extent.ExtentPos, extent.SnapshotId, extent.DeviceLocation)
-
-		err := dc.CopyExtentToSecondary(&extent)
-		if err != nil {
-			return err
-		}
-
-	}
-	return nil
-}
-
-func calculateMigratedExtents(policy string, vol *VolumeMetadata, dc *DeviceContext) ([]ExtentMetadata, error) {
-	var migratedExtents []ExtentMetadata
-	vem, err := GetVolumeExtentMap(dc, vol.VolumeSize, vol.SnapshotId)
-
-	if err != nil {
-		return migratedExtents, err
-	}
-
+func calculateMigratedExtents(policy string, vol *VolumeContext, dc *DeviceContext) (int, error) {
+	var migratedCount = 0
 	switch policy {
 	case "lru100":
 		//Placeholder: select least recently used 100 extents
 	default: //Migrate all extents that are not in the latest snapshot
 
-		for i, extent := range vem.extents {
-
+		for i := range vol.vem.extents {
+			extent := &vol.vem.extents[i] // take pointer to original
 			if extent.SnapshotId == 0 {
-				fmt.Println("Skipping unallocated extent at index ", i)
+				continue
 			}
+			if extent.SnapshotId != vol.volume.SnapshotId && extent.DeviceLocation == PRIMARY_DEVICE {
+				//migratedExtents = append(migratedExtents, extent)
+				err := dc.CopyExtentToSecondary(extent)
 
-			if extent.SnapshotId != vol.SnapshotId && extent.DeviceLocation == PRIMARY_DEVICE {
-				migratedExtents = append(migratedExtents, extent)
+				if err != nil {
+					return migratedCount, err
+				}
+				extent.DeviceLocation = SECONDARY_DEVICE
+				migratedCount++
+				err = dc.WriteExtent(extent, uint(i), SECONDARY_DEVICE)
+				if err != nil {
+					return 0, err
+				}
 			}
-
 		}
 
 	}
 
-	return migratedExtents, nil
+	return migratedCount, nil
 }
 
 func GetDeviceStats(device string) (*DirectFile, int64, error) {

@@ -487,24 +487,185 @@ func (s *TestSuite) TestSnapshotIO(c *C) {
 }
 
 func (s *TestSuite) TestMigration(c *C) {
-	//repeats := 10
-	//spread := 100
-	//positions := []int{0, 3, 43, 53, 92}
-	//
-	//blockData := loadBlocks()
-	//i := 0
-	//for r := 0; r < repeats; r++ {
-	//	for _, p := range positions {
-	//		blockIndices[i] = p + (r * spread)
-	//		i++
-	//	}
-	//}
-	//blockData = append(blockData, make([]byte, BLOCK_SIZE)) // for unmapped reads
-	//// Create a volume and open it
-	//err := CreateVolume(DEVICE, "vol1", GIGABYTE)
+	repeats := 10
+	spread := 100
+	positions := []int{0, 3, 43, 53, 92}
+
+	blockData := loadBlocks()
+	blockIndices := make([]int, len(positions)*repeats)
+	i := 0
+	for r := 0; r < repeats; r++ {
+		for _, p := range positions {
+			blockIndices[i] = p + (r * spread)
+			i++
+		}
+	}
+
+	fmt.Println(blockIndices)
+	// Create a volume and open it
+	err := CreateVolume(DEVICE, "vol1", GIGABYTE)
+	c.Assert(err, IsNil)
+	vc, err := OpenVolume(DEVICE, "vol1")
+	c.Assert(err, IsNil)
+
+	// Write
+	writeBlocks(c, vc, blockIndices, blockData)
+	vc.CloseVolume()
+
+	// Snapshot, open again and read back
+	err = CreateSnapshot(DEVICE, "vol1", true, time.Now().Format(time.RFC3339), nil)
+	c.Assert(err, IsNil)
+	vc, err = OpenVolume(DEVICE, "vol1")
+	c.Assert(err, IsNil)
+	readBlocks(c, vc, blockIndices, blockData)
+
+	err = MigrateVolume(DEVICE, "vol1", "default")
+	if err != nil {
+		c.Assert(err, IsNil)
+		return
+	}
+	vc.CloseVolume()
+	vc, err = OpenVolume(DEVICE, "vol1")
+	c.Assert(err, IsNil)
+	readBlocks(c, vc, blockIndices, blockData)
+
+	// Overwrite first and last blocks and read back
+	dummyBlock := make([]byte, BLOCK_SIZE)
+	for i := 0; i < BLOCK_SIZE; i++ {
+		dummyBlock[i] = 0xF0
+	}
+
+	fmt.Println("----------------------------------------")
+
+	writeBlocks(c, vc, []int{blockIndices[0], blockIndices[len(blockIndices)-1]}, [][]byte{dummyBlock, dummyBlock})
+	vc.CloseVolume()
+	vc, err = OpenVolume(DEVICE, "vol1")
+
+	// Create a merged expected block slice for verification
+	mergedBlocks := make([][]byte, len(blockIndices))
+	blockCount := len(blockData)
+	for i := range blockIndices {
+		mergedBlocks[i] = blockData[i%blockCount]
+	}
+
+	// Overwrite first and last blocks with dummyBlock
+	mergedBlocks[0] = dummyBlock
+	mergedBlocks[len(blockIndices)-1] = dummyBlock
+
+	// Now read and verify against the mergedBlocks
+	readBlocks(c, vc, blockIndices, mergedBlocks)
+
+}
+
+func (s *TestSuite) TestDefragment(c *C) {
+	repeats := 10
+	spread := 100
+	positions := []int{0, 3, 43, 53, 92}
+
+	blockData := loadBlocks()
+	blockIndices := make([]int, len(positions)*repeats)
+	i := 0
+	for r := 0; r < repeats; r++ {
+		for _, p := range positions {
+			blockIndices[i] = p + (r * spread)
+			i++
+		}
+	}
+
+	// Create a volume and open it
+	err := CreateVolume(DEVICE, "vol1", GIGABYTE)
+	c.Assert(err, IsNil)
+	vc, err := OpenVolume(DEVICE, "vol1")
+	c.Assert(err, IsNil)
+
+	// Write
+	writeBlocks(c, vc, blockIndices, blockData)
+	vc.CloseVolume()
+
+	// Snapshot, open again and read back
+	err = CreateSnapshot(DEVICE, "vol1", true, time.Now().Format(time.RFC3339), nil)
+	c.Assert(err, IsNil)
+	vc, err = OpenVolume(DEVICE, "vol1")
+	c.Assert(err, IsNil)
+	readBlocks(c, vc, blockIndices, blockData)
+
+	// Overwrite and read back
+	dummyBlock := make([]byte, BLOCK_SIZE)
+	for i := 0; i < BLOCK_SIZE; i++ {
+		dummyBlock[i] = 0xF0
+	}
+	writeBlocks(c, vc, blockIndices, [][]byte{dummyBlock})
+	readBlocks(c, vc, blockIndices, [][]byte{dummyBlock})
+	vc.CloseVolume()
+
+	// Clone volume and open
+	snapshotInfo, err := GetSnapshotInfo(DEVICE, "vol1")
+	c.Assert(err, IsNil)
+	c.Assert(snapshotInfo, HasLen, 2)
+	initialSnapshotIdx := slices.IndexFunc(snapshotInfo, func(si SnapshotInfo) bool { return si.ParentSnapshotId == 0 })
+	if initialSnapshotIdx == -1 {
+		c.FailNow()
+	}
+	initialSnapshotId := snapshotInfo[initialSnapshotIdx].SnapshotId
+	err = CloneSnapshot(DEVICE, "vol1clone", initialSnapshotId)
+	c.Assert(err, IsNil)
+	vc, err = OpenVolume(DEVICE, "vol1clone")
+	c.Assert(err, IsNil)
+
+	// Read original blocks from clone
+	readBlocks(c, vc, blockIndices, blockData)
+	vc.CloseVolume()
+
+	// Delete initial snapshot, open again and read back
+	err = DeleteSnapshot(DEVICE, initialSnapshotId)
+	c.Assert(err, IsNil)
+	vc, err = OpenVolume(DEVICE, "vol1")
+	c.Assert(err, IsNil)
+	readBlocks(c, vc, blockIndices, [][]byte{dummyBlock})
+
+	//// Validate metadata and clean up
+	//volumeInfo, err := GetVolumeInfo(DEVICE)
 	//c.Assert(err, IsNil)
-	//vc, err := OpenVolume(DEVICE, "vol1")
+	//c.Assert(volumeInfo, HasLen, 2)
+	//assertVolume(c, &volumeInfo[0], "vol1", GIGABYTE, 1)
+	//assertVolume(c, &volumeInfo[1], "vol1clone", GIGABYTE, 1)
+	//err = DeleteVolume(DEVICE, "vol1")
 	//c.Assert(err, IsNil)
-	//
+	//err = DeleteVolume(DEVICE, "vol1clone")
+	//c.Assert(err, IsNil)
+
+	for _, e1 := range vc.vem.extents {
+		if e1.SnapshotId != 0 {
+			fmt.Println(e1)
+		}
+	}
+	fmt.Println(vc.dc.superblock.AllocatedDeviceExtents)
+	fmt.Println(vc.dc.superblock.AllocatedSecondaryExtents)
+
+	err = vc.WriteBlock(blockData[1], 2000, true)
+
+	//vc.CloseVolume()
+	//vc, err = OpenVolume(DEVICE, "vol1")
+
+	for _, e1 := range vc.vem.extents {
+		if e1.SnapshotId != 0 {
+			fmt.Println(e1)
+		}
+	}
+	fmt.Println(vc.dc.superblock.AllocatedDeviceExtents)
+	fmt.Println(vc.dc.superblock.AllocatedSecondaryExtents)
+
+	err = vc.dc.Defragment()
+	if err != nil {
+		return
+	}
+
+	for _, e1 := range vc.vem.extents {
+		if e1.SnapshotId != 0 {
+			fmt.Println(e1)
+		}
+	}
+	fmt.Println(vc.dc.superblock.AllocatedDeviceExtents)
+	fmt.Println(vc.dc.superblock.AllocatedSecondaryExtents)
 
 }
