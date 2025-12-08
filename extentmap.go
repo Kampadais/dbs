@@ -15,8 +15,6 @@
 package dbs
 
 import (
-	"fmt"
-
 	"github.com/kelindar/bitmap"
 )
 
@@ -62,6 +60,39 @@ func GetSnapshotExtentMap(dc *DeviceContext, deviceSize uint64, snapshotId uint1
 	return sem, nil
 }
 
+func GetAllExtentMap(dc *DeviceContext, deviceSize uint64) (*ExtentMap, error) {
+	sem := &ExtentMap{
+		dc:                 dc,
+		totalVolumeExtents: uint(deviceSize / EXTENT_SIZE),
+		extents:            make([]ExtentMetadata, 0),
+	}
+	sem.extentBitmap.Grow(uint32(sem.totalVolumeExtents - 1))
+
+	eb := make([]ExtentMetadata, EXTENT_BATCH)
+	remaining := min(dc.totalDeviceExtents, uint(dc.superblock.AllocatedDeviceExtents))
+	for offset := uint(0); offset < remaining; offset += EXTENT_BATCH {
+		size := min(remaining-offset, EXTENT_BATCH)
+		if err := dc.ReadExtents(eb[:size], offset); err != nil {
+			return nil, err
+		}
+		for i := uint(0); i < size; i++ {
+			if eb[i].SnapshotId != 0 {
+
+				eidx := eb[i].ExtentPos
+				sem.extentBitmap.Set(eidx)
+				e := eb[i]
+				e.SnapshotId = eb[i].SnapshotId
+				e.ExtentPos = uint32(offset + i)
+				e.DeviceLocation = eb[i].DeviceLocation
+
+				sem.extents = append(sem.extents, e)
+
+			}
+		}
+	}
+	return sem, nil
+}
+
 // Get the map of a volume starting at a snapshot and including all ancestors.
 func GetVolumeExtentMap(dc *DeviceContext, deviceSize uint64, snapshotId uint16) (*ExtentMap, error) {
 	vem, err := GetSnapshotExtentMap(dc, deviceSize, snapshotId)
@@ -95,7 +126,6 @@ func (em *ExtentMap) WriteExtent(eidx uint32, location uint8) error {
 
 // Allocate a new extent into the map.
 func (em *ExtentMap) NewExtentToSnapshot(eidx uint32, snapshotId uint16) error {
-	fmt.Println("Allocating new extent ", eidx, " to snapshot ", snapshotId)
 	em.extents[eidx].SnapshotId = snapshotId
 	em.extents[eidx].ExtentPos = em.dc.superblock.AllocatedDeviceExtents
 	em.extents[eidx].DeviceLocation = PRIMARY_DEVICE

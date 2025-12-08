@@ -489,7 +489,6 @@ func (dc *DeviceContext) CopyExtentToSecondary(e *ExtentMetadata) error {
 	e.ExtentPos = dc.superblock.AllocatedSecondaryExtents
 	dc.superblock.AllocatedSecondaryExtents++
 
-	fmt.Println("Copying extent to secondary device at position ", e.ExtentPos)
 	//Write extent data to secondary device
 	if _, err := dc.secondary.WriteAt(abuf, uint64(uint(e.ExtentPos)*EXTENT_SIZE)); err != nil {
 		return fmt.Errorf("failed to write extent data to secondary device: %w", err)
@@ -499,7 +498,115 @@ func (dc *DeviceContext) CopyExtentToSecondary(e *ExtentMetadata) error {
 
 }
 
+type defragInfo struct {
+	used bool
+	ext  ExtentMetadata
+}
+
 func (dc *DeviceContext) Defragment() error {
+	allocated := uint(dc.superblock.AllocatedDeviceExtents)
+	if allocated == 0 {
+		return nil
+	}
+
+	var used []defragInfo
+
+	for i := uint(0); i < allocated; i++ {
+		used = append(used, defragInfo{
+			used: false,
+		})
+	}
+
+	vem, err := GetAllExtentMap(dc, dc.superblock.DeviceSize)
+	if err != nil {
+		return err
+	}
+
+	for _, ext := range vem.extents {
+		if ext.SnapshotId != 0 && ext.DeviceLocation == PRIMARY_DEVICE {
+			info := defragInfo{
+				used: true,
+				ext:  ext,
+			}
+			used[ext.ExtentPos] = info
+		}
+	}
+
+	for i := uint(0); i < allocated; i++ {
+		if used[i].used {
+			continue
+		}
+	}
+
+	for i := uint(0); i < allocated; i++ {
+		if used[i].used {
+			continue
+		}
+
+		//Find a used extent from the end
+		var j uint
+		for j = allocated - 1; j > i; j-- {
+			if used[j].used {
+				break
+			}
+		}
+		if j <= i {
+			break
+		}
+
+		err = MoveExtentData(dc, used[j].ext, i)
+
+		if err != nil {
+			return err
+		}
+		used[i].used = true
+		allocated--
+		used[j].used = false
+
+	}
 
 	return nil
+
+}
+
+func MoveExtentData(dc *DeviceContext, ext ExtentMetadata, i uint) error {
+	oldPos := ext.ExtentPos
+	//Read extent data from primary device
+	abuf := directio.AlignedBlock(EXTENT_SIZE)
+	if _, err := dc.f.ReadAt(abuf, uint64(dc.dataOffset+(uint(ext.ExtentPos)*EXTENT_SIZE))); err != nil {
+		return fmt.Errorf("failed to read extent data from primary device: %w", err)
+	}
+
+	ext.ExtentPos = uint32(i)
+
+	//Write extent data to secondary device
+	if _, err := dc.f.WriteAt(abuf, uint64(dc.dataOffset+uint(ext.ExtentPos)*EXTENT_SIZE)); err != nil {
+		return fmt.Errorf("failed to write extent data to secondary device: %w", err)
+	}
+
+	err := dc.WriteExtent(&ext, i, PRIMARY_DEVICE)
+	if err != nil {
+		return err
+	}
+
+	extDummy := ExtentMetadata{
+		SnapshotId:     0,
+		ExtentPos:      0,
+		DeviceLocation: 0,
+	}
+	err = dc.WriteExtent(&extDummy, uint(oldPos), PRIMARY_DEVICE)
+	if err != nil {
+		return err
+	}
+	dc.superblock.AllocatedDeviceExtents--
+	err = dc.WriteMetadata()
+	if err != nil {
+		return err
+	}
+	err = dc.WriteSuperblock()
+	if err != nil {
+		return err
+	}
+	return nil
+
 }

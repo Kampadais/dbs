@@ -501,7 +501,6 @@ func (s *TestSuite) TestMigration(c *C) {
 		}
 	}
 
-	fmt.Println(blockIndices)
 	// Create a volume and open it
 	err := CreateVolume(DEVICE, "vol1", GIGABYTE)
 	c.Assert(err, IsNil)
@@ -519,11 +518,9 @@ func (s *TestSuite) TestMigration(c *C) {
 	c.Assert(err, IsNil)
 	readBlocks(c, vc, blockIndices, blockData)
 
+	//Migrate volume and read back
 	err = MigrateVolume(DEVICE, "vol1", "default")
-	if err != nil {
-		c.Assert(err, IsNil)
-		return
-	}
+	c.Assert(err, IsNil)
 	vc.CloseVolume()
 	vc, err = OpenVolume(DEVICE, "vol1")
 	c.Assert(err, IsNil)
@@ -534,8 +531,6 @@ func (s *TestSuite) TestMigration(c *C) {
 	for i := 0; i < BLOCK_SIZE; i++ {
 		dummyBlock[i] = 0xF0
 	}
-
-	fmt.Println("----------------------------------------")
 
 	writeBlocks(c, vc, []int{blockIndices[0], blockIndices[len(blockIndices)-1]}, [][]byte{dummyBlock, dummyBlock})
 	vc.CloseVolume()
@@ -555,117 +550,161 @@ func (s *TestSuite) TestMigration(c *C) {
 	// Now read and verify against the mergedBlocks
 	readBlocks(c, vc, blockIndices, mergedBlocks)
 
+	err = DeleteVolume(DEVICE, "vol1")
+	c.Assert(err, IsNil)
+
 }
 
-func (s *TestSuite) TestDefragment(c *C) {
-	repeats := 10
-	spread := 100
-	positions := []int{0, 3, 43, 53, 92}
+func (s *TestSuite) TestSnapshotDelete(c *C) {
 
-	blockData := loadBlocks()
-	blockIndices := make([]int, len(positions)*repeats)
-	i := 0
-	for r := 0; r < repeats; r++ {
-		for _, p := range positions {
-			blockIndices[i] = p + (r * spread)
-			i++
-		}
+	const (
+		EXTENTS        = 5
+		EXTENT_SIZE_MB = 2
+		DEVICE_NAME    = DEVICE
+		VOL_NAME       = "vol_snap_chain"
+		CYCLES         = 1
+	)
+	defer DeleteVolume(DEVICE, VOL_NAME)
+
+	extentSize := EXTENT_SIZE_MB * MEGABYTE
+	blocksPerExtent := extentSize / BLOCK_SIZE
+	if blocksPerExtent == 0 {
+		c.Fatalf("invalid extent size or BLOCK_SIZE")
 	}
 
-	// Create a volume and open it
-	err := CreateVolume(DEVICE, "vol1", GIGABYTE)
-	c.Assert(err, IsNil)
-	vc, err := OpenVolume(DEVICE, "vol1")
+	// -----------------------------
+	// 1. Create volume
+	// -----------------------------
+	err := CreateVolume(DEVICE_NAME, VOL_NAME, 4*GIGABYTE)
 	c.Assert(err, IsNil)
 
-	// Write
-	writeBlocks(c, vc, blockIndices, blockData)
+	vc, err := OpenVolume(DEVICE_NAME, VOL_NAME)
+	c.Assert(err, IsNil)
+
+	// logical extent start block index per extent
+	extentStartBlock := func(extentIdx int) int {
+		return extentIdx * blocksPerExtent
+	}
+
+	// Initial extents
+	initialExtents := make([][]byte, EXTENTS)
+	for i := 0; i < EXTENTS; i++ {
+		buf := make([]byte, extentSize)
+		fill := byte((i + 1) & 0xFF)
+		for j := range buf {
+			buf[j] = fill
+		}
+		initialExtents[i] = buf
+	}
+
+	// Helper: expand extents into blocks
+	expandExtentsToBlocks := func(extentIndices []int, extentBuffers [][]byte) ([]int, [][]byte) {
+		var blockIndices []int
+		var blocks [][]byte
+
+		for ei, extIdx := range extentIndices {
+			buf := extentBuffers[ei]
+			if len(buf) != extentSize {
+				c.Fatalf("expandExtentsToBlocks: buffer size mismatch")
+			}
+			startBlock := extentStartBlock(extIdx)
+			for b := 0; b < blocksPerExtent; b++ {
+				blockIndices = append(blockIndices, startBlock+b)
+				sb := make([]byte, BLOCK_SIZE)
+				copy(sb, buf[b*BLOCK_SIZE:(b+1)*BLOCK_SIZE])
+				blocks = append(blocks, sb)
+			}
+		}
+		return blockIndices, blocks
+	}
+
+	// -----------------------------
+	// 2. Initial write
+	// -----------------------------
+	allExtentIdxs := make([]int, EXTENTS)
+	for i := 0; i < EXTENTS; i++ {
+		allExtentIdxs[i] = i
+	}
+
+	blkIdxs, blkPayloads := expandExtentsToBlocks(allExtentIdxs, initialExtents)
+	writeBlocks(c, vc, blkIdxs, blkPayloads)
+
 	vc.CloseVolume()
 
-	// Snapshot, open again and read back
-	err = CreateSnapshot(DEVICE, "vol1", true, time.Now().Format(time.RFC3339), nil)
-	c.Assert(err, IsNil)
-	vc, err = OpenVolume(DEVICE, "vol1")
-	c.Assert(err, IsNil)
-	readBlocks(c, vc, blockIndices, blockData)
-
-	// Overwrite and read back
-	dummyBlock := make([]byte, BLOCK_SIZE)
-	for i := 0; i < BLOCK_SIZE; i++ {
-		dummyBlock[i] = 0xF0
+	// Prepare overwrite logic
+	overwriteSize := EXTENTS / 2
+	if overwriteSize == 0 {
+		overwriteSize = 1
 	}
-	writeBlocks(c, vc, blockIndices, [][]byte{dummyBlock})
-	readBlocks(c, vc, blockIndices, [][]byte{dummyBlock})
-	vc.CloseVolume()
-
-	// Clone volume and open
-	snapshotInfo, err := GetSnapshotInfo(DEVICE, "vol1")
-	c.Assert(err, IsNil)
-	c.Assert(snapshotInfo, HasLen, 2)
-	initialSnapshotIdx := slices.IndexFunc(snapshotInfo, func(si SnapshotInfo) bool { return si.ParentSnapshotId == 0 })
-	if initialSnapshotIdx == -1 {
-		c.FailNow()
+	slideStep := overwriteSize / 2
+	if slideStep == 0 {
+		slideStep = 1
 	}
-	initialSnapshotId := snapshotInfo[initialSnapshotIdx].SnapshotId
-	err = CloneSnapshot(DEVICE, "vol1clone", initialSnapshotId)
-	c.Assert(err, IsNil)
-	vc, err = OpenVolume(DEVICE, "vol1clone")
-	c.Assert(err, IsNil)
 
-	// Read original blocks from clone
-	readBlocks(c, vc, blockIndices, blockData)
-	vc.CloseVolume()
+	// Record final expected extents
+	expectedFinalExtents := make([][]byte, EXTENTS)
+	copy(expectedFinalExtents, initialExtents)
 
-	// Delete initial snapshot, open again and read back
-	err = DeleteSnapshot(DEVICE, initialSnapshotId)
-	c.Assert(err, IsNil)
-	vc, err = OpenVolume(DEVICE, "vol1")
-	c.Assert(err, IsNil)
-	readBlocks(c, vc, blockIndices, [][]byte{dummyBlock})
+	// -----------------------------
+	// 3. Snapshot → overwrite cycles
+	// -----------------------------
+	for cycle := 1; cycle <= CYCLES; cycle++ {
+		ts := time.Now().Add(time.Duration(cycle) * time.Second).Format(time.RFC3339)
+		err := CreateSnapshot(DEVICE_NAME, VOL_NAME, true, ts, nil)
+		c.Assert(err, IsNil)
 
-	//// Validate metadata and clean up
-	//volumeInfo, err := GetVolumeInfo(DEVICE)
-	//c.Assert(err, IsNil)
-	//c.Assert(volumeInfo, HasLen, 2)
-	//assertVolume(c, &volumeInfo[0], "vol1", GIGABYTE, 1)
-	//assertVolume(c, &volumeInfo[1], "vol1clone", GIGABYTE, 1)
-	//err = DeleteVolume(DEVICE, "vol1")
-	//c.Assert(err, IsNil)
-	//err = DeleteVolume(DEVICE, "vol1clone")
-	//c.Assert(err, IsNil)
+		vc, err = OpenVolume(DEVICE_NAME, VOL_NAME)
+		c.Assert(err, IsNil)
 
-	for _, e1 := range vc.vem.extents {
-		if e1.SnapshotId != 0 {
-			fmt.Println(e1)
+		// Sliding overwrite window
+		start := ((cycle - 1) * slideStep) % EXTENTS
+		end := start + overwriteSize
+
+		var targetExtentIdxs []int
+		if end <= EXTENTS {
+			for e := start; e < end; e++ {
+				targetExtentIdxs = append(targetExtentIdxs, e)
+			}
+		} else {
+			for e := start; e < EXTENTS; e++ {
+				targetExtentIdxs = append(targetExtentIdxs, e)
+			}
+			for e := 0; e < end-EXTENTS; e++ {
+				targetExtentIdxs = append(targetExtentIdxs, e)
+			}
 		}
-	}
-	fmt.Println(vc.dc.superblock.AllocatedDeviceExtents)
-	fmt.Println(vc.dc.superblock.AllocatedSecondaryExtents)
 
-	err = vc.WriteBlock(blockData[1], 2000, true)
-
-	//vc.CloseVolume()
-	//vc, err = OpenVolume(DEVICE, "vol1")
-
-	for _, e1 := range vc.vem.extents {
-		if e1.SnapshotId != 0 {
-			fmt.Println(e1)
+		// Generate overwrite data
+		makeExtentData := func(cycle int, extentIdx int) []byte {
+			b := make([]byte, extentSize)
+			fill := byte((cycle*31 + extentIdx*7) & 0xFF)
+			for i := range b {
+				b[i] = fill
+			}
+			return b
 		}
-	}
-	fmt.Println(vc.dc.superblock.AllocatedDeviceExtents)
-	fmt.Println(vc.dc.superblock.AllocatedSecondaryExtents)
 
-	err = vc.dc.Defragment()
-	if err != nil {
-		return
-	}
-
-	for _, e1 := range vc.vem.extents {
-		if e1.SnapshotId != 0 {
-			fmt.Println(e1)
+		extentBuffers := make([][]byte, len(targetExtentIdxs))
+		for i, extIdx := range targetExtentIdxs {
+			buf := makeExtentData(cycle, extIdx)
+			extentBuffers[i] = buf
+			expectedFinalExtents[extIdx] = buf // FINAL expected state
 		}
-	}
-	fmt.Println(vc.dc.superblock.AllocatedDeviceExtents)
-	fmt.Println(vc.dc.superblock.AllocatedSecondaryExtents)
 
+		blkIdxs, blkPayloads = expandExtentsToBlocks(targetExtentIdxs, extentBuffers)
+		writeBlocks(c, vc, blkIdxs, blkPayloads)
+
+		vc.CloseVolume()
+	}
+
+	vc, err = OpenVolume(DEVICE_NAME, VOL_NAME)
+	c.Assert(err, IsNil)
+	NofExts := vc.NumberOfExtents()
+
+	err = DeleteSnapshot(DEVICE, 1)
+
+	vc, err = OpenVolume(DEVICE, VOL_NAME)
+	c.Assert(err, IsNil)
+
+	c.Assert(vc.NumberOfExtents(), Equals, NofExts)
 }

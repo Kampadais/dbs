@@ -621,3 +621,33 @@ func (dc *DeviceContext) SnapshotsSize(vm *VolumeMetadata, sid uint16) uint64 {
 	return totalSize
 
 }
+
+func (vc *VolumeContext) PrintExtents() error {
+	fmt.Println("---------- Extents for volume  ", toString(vc.volume.VolumeName), "----------")
+	for _, e1 := range vc.vem.extents {
+		if e1.SnapshotId != 0 {
+			fmt.Println(e1)
+		}
+	}
+	fmt.Println("---------------------------------------------------")
+	return nil
+}
+
+func (vc *VolumeContext) NumberOfExtents() int {
+	count := 0
+	for _, e1 := range vc.vem.extents {
+		if e1.SnapshotId != 0 {
+			count++
+		}
+	}
+	return count
+}
+
+func toString(b [256]byte) string {
+	// find first zero byte
+	n := 0
+	for n < len(b) && b[n] != 0 {
+		n++
+	}
+	return string(b[:n])
+}

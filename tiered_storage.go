@@ -16,29 +16,21 @@ func MigrateVolume(device string, volume string, policy string) error {
 		return err
 	}
 
-	fmt.Printf("Starting storage migration for device: %s , volume : %s with policy %s\n", device, volume, policy)
-
 	mex, err := calculateMigratedExtents(policy, vol, dc)
 
 	if uint(dc.superblock.AllocatedSecondaryExtents)+uint(mex*EXTENT_SIZE) > dc.totalSecondaryExtents {
 		//return fmt.Errorf("no space left on device")
 		//TODO
-		fmt.Println("Sec storage size :", dc.totalSecondaryExtents, " Allocated sec extents :", dc.superblock.AllocatedSecondaryExtents, " Extents to migrate size :", mex)
-		fmt.Printf("Warning: not enough space on device for migration, proceeding anyway\n")
 	}
 
 	if err != nil {
 		return err
 	}
-
-	fmt.Printf("Number of extents to migrate: %d\n", mex)
 
 	err = dc.WriteMetadata()
 	if err != nil {
 		return err
 	}
-
-	fmt.Printf("Storage migration completed \n")
 
 	return nil
 }
