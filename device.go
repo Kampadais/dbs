@@ -18,14 +18,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/ncw/directio"
 )
 
 const (
-	SIZEOF_EXTENT_METADATA = 6 + EXTENT_BITMAP_SIZE
+	SIZEOF_EXTENT_METADATA = 1 + 6 + EXTENT_BITMAP_SIZE
 )
 
 func divRoundUp(x uint, y uint) uint {
@@ -34,30 +33,24 @@ func divRoundUp(x uint, y uint) uint {
 
 // The device context holds the device file descriptor and all metadata except extents.
 type DeviceContext struct {
-	f                  *DirectFile
-	superblock         *Superblock
-	volumes            [MAX_VOLUMES]VolumeMetadata
-	snapshots          [MAX_SNAPSHOTS]SnapshotMetadata
-	extentOffset       uint
-	totalDeviceExtents uint
-	dataOffset         uint
+	f                     *DirectFile
+	secondary             *DirectFile // Secondary device for tiered storage
+	superblock            *Superblock
+	volumes               [MAX_VOLUMES]VolumeMetadata
+	snapshots             [MAX_SNAPSHOTS]SnapshotMetadata
+	labels                []LabelMetadata
+	extentOffset          uint
+	totalDeviceExtents    uint
+	totalSecondaryExtents uint //TODO
+	dataOffset            uint
 }
 
 // Initialize a new, empty device context.
 func NewDeviceContext(device string) (*DeviceContext, error) {
-	f, err := NewDirectFile(device, os.O_RDWR, 0660)
+	f, deviceSize, err := GetDeviceStats(device)
+
 	if err != nil {
-		return nil, fmt.Errorf("cannot open %v: %w", device, err)
-	}
-	deviceSize, err := f.Size()
-	if err != nil {
-		return nil, err
-	}
-	if deviceSize == 0 {
-		return nil, fmt.Errorf("device with zero size")
-	}
-	if deviceSize < (100 * (1 << 20)) {
-		return nil, fmt.Errorf("device size less than 100 MB")
+		return nil, fmt.Errorf("cannot open device %s: %w", device, err)
 	}
 
 	dc := &DeviceContext{
@@ -88,6 +81,28 @@ func GetDeviceContext(device string) (*DeviceContext, error) {
 	if err := dc.ReadMetadata(); err != nil {
 		return nil, err
 	}
+
+	if dc.superblock.HasSecondaryDevice == 1 {
+		secondaryPath := string(dc.superblock.SecondaryDevicePath[:])
+		// Trim null bytes
+		for i, b := range dc.superblock.SecondaryDevicePath {
+			if b == 0 {
+				secondaryPath = string(dc.superblock.SecondaryDevicePath[:i])
+				break
+			}
+		}
+
+		sf, size, err := GetDeviceStats(secondaryPath)
+		if err != nil {
+			dc.f.Close()
+			return nil, fmt.Errorf("cannot open secondary device %s: %w", secondaryPath, err)
+		}
+
+		dc.secondary = sf
+		dc.totalSecondaryExtents = uint((size) / EXTENT_SIZE)
+		dc.secondary.Name = secondaryPath
+	}
+
 	return dc, nil
 }
 
@@ -126,6 +141,51 @@ func (dc *DeviceContext) ReadMetadata() error {
 	if err := binary.Read(buf, binary.LittleEndian, dc.snapshots[:]); err != nil {
 		return fmt.Errorf("failed to deserialize snapshot metadata: %w", err)
 	}
+
+	var labelCount uint32
+	if err := binary.Read(buf, binary.LittleEndian, &labelCount); err != nil {
+		return fmt.Errorf("failed to deserialize label count: %w", err)
+	}
+
+	dc.labels = make([]LabelMetadata, 0, labelCount)
+	for i := uint32(0); i < labelCount; i++ {
+		var sid uint16
+		if err := binary.Read(buf, binary.LittleEndian, &sid); err != nil {
+			return fmt.Errorf("failed to deserialize label snapshot id: %w", err)
+		}
+
+		var kvCount uint32
+		if err := binary.Read(buf, binary.LittleEndian, &kvCount); err != nil {
+			return fmt.Errorf("failed to deserialize label kv count: %w", err)
+		}
+
+		labels := make(map[string]string)
+		for j := uint32(0); j < kvCount; j++ {
+			var klen uint32
+			if err := binary.Read(buf, binary.LittleEndian, &klen); err != nil {
+				return fmt.Errorf("failed to deserialize label key length: %w", err)
+			}
+			kbuf := make([]byte, klen)
+			if _, err := buf.Read(kbuf); err != nil {
+				return fmt.Errorf("failed to read label key: %w", err)
+			}
+			var vlen uint32
+			if err := binary.Read(buf, binary.LittleEndian, &vlen); err != nil {
+				return fmt.Errorf("failed to deserialize label value length: %w", err)
+			}
+			vbuf := make([]byte, vlen)
+			if _, err := buf.Read(vbuf); err != nil {
+				return fmt.Errorf("failed to read label value: %w", err)
+			}
+			labels[string(kbuf)] = string(vbuf)
+		}
+
+		dc.labels = append(dc.labels, LabelMetadata{
+			Sid:    sid,
+			Labels: labels,
+		})
+	}
+
 	return nil
 }
 
@@ -144,11 +204,19 @@ func (dc *DeviceContext) ReadExtents(eb []ExtentMetadata, eidx uint) error {
 	return nil
 }
 
-func (dc *DeviceContext) ReadBlockData(data []byte, epos uint, bidx uint) error {
-	offset := uint64(dc.dataOffset + (epos * EXTENT_SIZE) + (bidx * BLOCK_SIZE))
-	if _, err := dc.f.ReadAt(data[0:BLOCK_SIZE], offset); err != nil {
-		return fmt.Errorf("failed to read block: %w", err)
+func (dc *DeviceContext) ReadBlockData(data []byte, epos uint, bidx uint, location uint8) error {
+	if location == PRIMARY_DEVICE {
+		offset := uint64(dc.dataOffset + (epos * EXTENT_SIZE) + (bidx * BLOCK_SIZE))
+		if _, err := dc.f.ReadAt(data[0:BLOCK_SIZE], offset); err != nil {
+			return fmt.Errorf("failed to read block: %w", err)
+		}
+	} else {
+		offset := uint64((epos * EXTENT_SIZE) + (bidx * BLOCK_SIZE))
+		if _, err := dc.secondary.ReadAt(data[0:BLOCK_SIZE], offset); err != nil {
+			return fmt.Errorf("failed to read block from secondary device: %w", err)
+		}
 	}
+
 	return nil
 }
 
@@ -173,12 +241,43 @@ func (dc *DeviceContext) WriteMetadata() error {
 	if err := binary.Write(buf, binary.LittleEndian, dc.snapshots); err != nil {
 		return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
 	}
+
+	if err := binary.Write(buf, binary.LittleEndian, uint32(len(dc.labels))); err != nil {
+		return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
+	}
+	for _, l := range dc.labels {
+		if err := binary.Write(buf, binary.LittleEndian, l.Sid); err != nil {
+			return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
+		}
+
+		if err := binary.Write(buf, binary.LittleEndian, uint32(len(l.Labels))); err != nil {
+			return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
+		}
+		for k, v := range l.Labels {
+			if err := writeString(buf, k); err != nil {
+				return fmt.Errorf("failed to serialize label key: %w", err)
+			}
+			if err := writeString(buf, v); err != nil {
+				return fmt.Errorf("failed to serialize label value: %w", err)
+			}
+		}
+
+	}
+
 	abuf := directio.AlignedBlock(int(dc.extentOffset - BLOCK_SIZE))
 	copy(abuf[0:], buf.Bytes())
 	if _, err := dc.f.WriteAt(abuf, BLOCK_SIZE); err != nil {
 		return fmt.Errorf("failed to write metadata: %w", err)
 	}
+
 	return nil
+}
+func writeString(w *bytes.Buffer, s string) error {
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(s))); err != nil {
+		return err
+	}
+	_, err := w.Write([]byte(s))
+	return err
 }
 
 func (dc *DeviceContext) WriteExtents(eb []ExtentMetadata, eidx uint) error {
@@ -200,8 +299,34 @@ func (dc *DeviceContext) WriteExtents(eb []ExtentMetadata, eidx uint) error {
 	return nil
 }
 
-func (dc *DeviceContext) WriteExtent(e *ExtentMetadata, eidx uint) error {
+func (dc *DeviceContext) WriteSecondaryExtent(eb []ExtentMetadata, eidx uint) error {
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, eb); err != nil {
+		return fmt.Errorf("failed to serialize extent metadata: %w", err)
+	}
+	offset := uint64(dc.extentOffset + (eidx * SIZEOF_EXTENT_METADATA))
+	size := uint64(binary.Size(eb))
+	blocks := ((offset + size) / BLOCK_SIZE) - (offset / BLOCK_SIZE) + 1
+	abuf := directio.AlignedBlock(int(BLOCK_SIZE * blocks))
+	if _, err := dc.secondary.ReadAt(abuf, (offset/BLOCK_SIZE)*BLOCK_SIZE); err != nil {
+		return fmt.Errorf("failed to read extent metadata: %w", err)
+	}
+
+	copy(abuf[offset%BLOCK_SIZE:(offset%BLOCK_SIZE)+size], buf.Bytes())
+	if _, err := dc.secondary.WriteAt(abuf, (offset/BLOCK_SIZE)*BLOCK_SIZE); err != nil {
+		return fmt.Errorf("failed to write extent metadata: %w", err)
+	}
+	return nil
+}
+
+func (dc *DeviceContext) WriteExtent(e *ExtentMetadata, eidx uint, location uint8) error {
+	e.DeviceLocation = location
 	return dc.WriteExtents([]ExtentMetadata{*e}, eidx)
+}
+
+func (dc *DeviceContext) WriteExtentSeconary(e *ExtentMetadata, eidx uint) error {
+	return dc.WriteSecondaryExtent([]ExtentMetadata{*e}, eidx)
 }
 
 func (dc *DeviceContext) WriteBlockData(data []byte, epos uint, bidx uint) error {
@@ -291,7 +416,7 @@ func (dc *DeviceContext) AddVolume(volumeName string, volumeSize uint64) (*Volum
 		return nil, fmt.Errorf("max volume count reached")
 	}
 
-	sid, err := dc.AddSnapshot(0)
+	sid, err := dc.AddSnapshot(0, false, time.Now().Format(time.RFC3339), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +427,7 @@ func (dc *DeviceContext) AddVolume(volumeName string, volumeSize uint64) (*Volum
 }
 
 // Add a new snapshot. Return the snapshot identifier.
-func (dc *DeviceContext) AddSnapshot(parentSnapshotId uint16) (uint16, error) {
+func (dc *DeviceContext) AddSnapshot(parentSnapshotId uint16, userMade bool, createdTime string, labels map[string]string) (uint16, error) {
 	var sidx uint
 	for sidx = 0; sidx < MAX_SNAPSHOTS && dc.snapshots[sidx].CreatedAt != 0; sidx++ {
 	}
@@ -311,7 +436,27 @@ func (dc *DeviceContext) AddSnapshot(parentSnapshotId uint16) (uint16, error) {
 	}
 
 	dc.snapshots[sidx].ParentSnapshotId = parentSnapshotId
-	dc.snapshots[sidx].CreatedAt = time.Now().Unix()
+
+	t, err := time.Parse(time.RFC3339, createdTime)
+	if err != nil {
+		panic(err)
+	}
+
+	// Convert to int64 like time.Now().Unix()
+	unixTime := t.Unix()
+	dc.snapshots[sidx].CreatedAt = unixTime
+	dc.snapshots[sidx].UserCreated = userMade
+	if len(labels) > 0 {
+		lab := make(map[string]string)
+		for k, v := range labels {
+			lab[k] = v
+		}
+		dc.labels = append(dc.labels, LabelMetadata{
+			Sid:    uint16(sidx) + 1,
+			Labels: lab,
+		})
+	}
+
 	return uint16(sidx) + 1, nil
 }
 
@@ -321,5 +466,132 @@ func (dc *DeviceContext) Close() error {
 		return fmt.Errorf("cannot sync device: %w", err)
 	}
 	dc.f.Close()
+
+	// Close secondary device if open
+	if dc.secondary != nil {
+		if err := dc.secondary.Sync(); err != nil {
+			return fmt.Errorf("cannot sync secondary device: %w", err)
+		}
+		dc.secondary.Close()
+	}
+
+	return nil
+}
+
+func (dc *DeviceContext) CopyExtentToSecondary(e *ExtentMetadata) error {
+	//Read extent data from primary device
+	abuf := directio.AlignedBlock(EXTENT_SIZE)
+	if _, err := dc.f.ReadAt(abuf, uint64(dc.dataOffset+(uint(e.ExtentPos)*EXTENT_SIZE))); err != nil {
+		return fmt.Errorf("failed to read extent data from primary device: %w", err)
+	}
+
+	e.DeviceLocation = SECONDARY_DEVICE
+	e.ExtentPos = dc.superblock.AllocatedSecondaryExtents
+	dc.superblock.AllocatedSecondaryExtents++
+
+	//Write extent data to secondary device
+	if _, err := dc.secondary.WriteAt(abuf, uint64(uint(e.ExtentPos)*EXTENT_SIZE)); err != nil {
+		return fmt.Errorf("failed to write extent data to secondary device: %w", err)
+	}
+
+	return nil
+
+}
+
+type defragInfo struct {
+	used bool
+	ext  ExtentMetadata
+}
+
+func (dc *DeviceContext) Defragment() error {
+	allocated := uint(dc.superblock.AllocatedDeviceExtents)
+	if allocated == 0 {
+		return nil
+	}
+
+	used := make(map[uint]ExtentMetadata)
+	eb := make([]ExtentMetadata, EXTENT_BATCH)
+	for offset := uint(0); offset < allocated; offset += EXTENT_BATCH {
+		size := min(allocated-offset, EXTENT_BATCH)
+		if err := dc.ReadExtents(eb[:size], offset); err != nil {
+			return err
+		}
+		for i := uint(0); i < size; i++ {
+			if eb[i].SnapshotId != 0 {
+				used[offset+i] = eb[i]
+			}
+		}
+	}
+
+	// Compaction loop
+	for i := uint(0); i < allocated; i++ {
+		if _, ok := used[i]; ok {
+			continue
+		}
+
+		// Hole found at i, find an extent to move from the end
+		var j uint
+		found := false
+		for j = allocated - 1; j > i; j-- {
+			if _, ok := used[j]; ok {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			// No more extents to move, we can shrink AllocatedDeviceExtents to i
+			allocated = i
+			break
+		}
+
+		// Move j to i
+		if err := dc.MoveExtentData(used[j], j, i); err != nil {
+			return err
+		}
+		used[i] = used[j]
+		delete(used, j)
+
+		// Shrink allocated boundary if we moved from the current tail
+		if j == allocated-1 {
+			allocated--
+		}
+	}
+
+	// Final shrink of allocated boundary for any existing trailing empty slots
+	for allocated > 0 {
+		if _, ok := used[allocated-1]; ok {
+			break
+		}
+		allocated--
+	}
+
+	dc.superblock.AllocatedDeviceExtents = uint32(allocated)
+	return nil
+}
+
+func (dc *DeviceContext) MoveExtentData(ext ExtentMetadata, oldPos uint, newPos uint) error {
+	// Read extent data from primary device
+	abuf := directio.AlignedBlock(EXTENT_SIZE)
+	if _, err := dc.f.ReadAt(abuf, uint64(dc.dataOffset+(oldPos*EXTENT_SIZE))); err != nil {
+		return fmt.Errorf("failed to read extent data from primary device: %w", err)
+	}
+
+	// Write extent data to new physical position
+	if _, err := dc.f.WriteAt(abuf, uint64(dc.dataOffset+(newPos*EXTENT_SIZE))); err != nil {
+		return fmt.Errorf("failed to write extent data: %w", err)
+	}
+
+	// Write metadata to new physical position
+	// Note: ext already contains the correct logical position in ExtentPos
+	if err := dc.WriteExtent(&ext, newPos, PRIMARY_DEVICE); err != nil {
+		return err
+	}
+
+	// Clear metadata at old physical position
+	extDummy := ExtentMetadata{}
+	if err := dc.WriteExtent(&extDummy, oldPos, 0); err != nil {
+		return err
+	}
 	return nil
 }
