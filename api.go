@@ -44,13 +44,20 @@ const (
 	EXTENT_BITMAP_SIZE   = 32
 	BLOCK_BITS_IN_EXTENT = 8
 	BLOCK_MASK_IN_EXTENT = 0xFF
+
+	PRIMARY_DEVICE   = 1
+	SECONDARY_DEVICE = 2
 )
 
 type Superblock struct {
-	Magic                  [8]byte
-	Version                uint32 // 16-bit major, 8-bit minor, 8-bit patch
-	AllocatedDeviceExtents uint32
-	DeviceSize             uint64
+	Magic                     [8]byte
+	Version                   uint32 // 16-bit major, 8-bit minor, 8-bit patch
+	AllocatedDeviceExtents    uint32
+	DeviceSize                uint64
+	HasSecondaryDevice        uint8
+	AllocatedSecondaryExtents uint32
+	SecondarySize             uint64
+	SecondaryDevicePath       [256]byte
 }
 
 type VolumeMetadata struct {
@@ -62,12 +69,20 @@ type VolumeMetadata struct {
 type SnapshotMetadata struct {
 	ParentSnapshotId uint16
 	CreatedAt        int64
+	UserCreated      bool
+	Size             uint64
+}
+
+type LabelMetadata struct {
+	Sid    uint16
+	Labels map[string]string
 }
 
 type ExtentMetadata struct {
-	SnapshotId  uint16
-	ExtentPos   uint32
-	BlockBitmap [EXTENT_BITMAP_SIZE]byte
+	SnapshotId     uint16
+	ExtentPos      uint32
+	BlockBitmap    [EXTENT_BITMAP_SIZE]byte
+	DeviceLocation uint8
 }
 
 func (v *VolumeMetadata) setName(volumeName string) {
@@ -78,11 +93,15 @@ func (v *VolumeMetadata) setName(volumeName string) {
 // Query API
 
 type DeviceInfo struct {
-	Version                string
-	DeviceSize             uint64
-	TotalDeviceExtents     uint
-	AllocatedDeviceExtents uint
-	VolumeCount            uint
+	Version                         string
+	DeviceSize                      uint64
+	TotalDeviceExtents              uint
+	AllocatedDeviceExtents          uint
+	VolumeCount                     uint
+	HasSecondaryDevice              bool
+	SecondaryDeviceSize             uint64
+	AllocatedSecondaryDeviceExtents uint //TODO
+	SecondaryDeviceName             string
 }
 
 type VolumeInfo struct {
@@ -96,7 +115,10 @@ type VolumeInfo struct {
 type SnapshotInfo struct {
 	SnapshotId       uint
 	ParentSnapshotId uint
+	UserCreated      bool
 	CreatedAt        time.Time
+	Size             uint64
+	Labels           map[string]string
 }
 
 func humanVersion(version uint32) string {
@@ -157,6 +179,16 @@ func GetSnapshotInfo(device string, volumeName string) ([]SnapshotInfo, error) {
 		si[siidx].SnapshotId = uint(sid)
 		si[siidx].ParentSnapshotId = uint(dc.snapshots[sid-1].ParentSnapshotId)
 		si[siidx].CreatedAt = time.Unix(dc.snapshots[sid-1].CreatedAt, 0)
+		si[siidx].UserCreated = dc.snapshots[sid-1].UserCreated
+		for _, l := range dc.labels {
+			if l.Sid == sid {
+				si[siidx].Labels = l.Labels
+				break
+			}
+
+		}
+		si[siidx].Size = dc.SnapshotsSize(v, sid)
+
 		siidx++
 	}
 	dc.Close()
@@ -177,6 +209,24 @@ func InitDevice(device string) error {
 			return err
 		}
 	}
+
+	if err := dc.WriteMetadata(); err != nil {
+		return err
+	}
+	if err := dc.WriteSuperblock(); err != nil {
+		return err
+	}
+	return dc.Close()
+}
+
+func DefragmentDevice(device string) error {
+	dc, err := GetDeviceContext(device)
+	if err != nil {
+		return err
+	}
+	if err := dc.Defragment(); err != nil {
+		return err
+	}
 	if err := dc.WriteMetadata(); err != nil {
 		return err
 	}
@@ -187,7 +237,7 @@ func InitDevice(device string) error {
 }
 
 func VacuumDevice(device string) error {
-	return fmt.Errorf("not implemented")
+	return InitDevice(device)
 }
 
 func CreateVolume(device string, volumeName string, volumeSize uint64) error {
@@ -226,7 +276,7 @@ func RenameVolume(device string, volumeName string, newVolumeName string) error 
 	return dc.Close()
 }
 
-func CreateSnapshot(device string, volumeName string) error {
+func CreateSnapshot(device string, volumeName string, userMade bool, createdTime string, labels map[string]string) error {
 	dc, err := GetDeviceContext(device)
 	if err != nil {
 		return err
@@ -235,7 +285,7 @@ func CreateSnapshot(device string, volumeName string) error {
 	if v == nil {
 		return fmt.Errorf("volume %v not found", volumeName)
 	}
-	sid, err := dc.AddSnapshot(v.SnapshotId)
+	sid, err := dc.AddSnapshot(v.SnapshotId, userMade, createdTime, labels)
 	if err != nil {
 		return err
 	}
@@ -296,6 +346,12 @@ func DeleteVolume(device string, volumeName string) error {
 			return err
 		}
 		dc.snapshots[sid-1].CreatedAt = 0
+		for i, l := range dc.labels {
+			if l.Sid == sid-1 {
+				dc.labels[i] = LabelMetadata{}
+				break
+			}
+		}
 	}
 	*v = VolumeMetadata{}
 	if err := dc.WriteMetadata(); err != nil {
@@ -390,8 +446,8 @@ func (vc *VolumeContext) ReadBlock(data []byte, block uint64) error {
 		copy(data, emptyBlock[:])
 		return nil
 	}
-	// Read data from device
-	if err := vc.dc.ReadBlockData(data, uint(e.ExtentPos), bidx); err != nil {
+
+	if err := vc.dc.ReadBlockData(data, uint(e.ExtentPos), bidx, e.DeviceLocation); err != nil {
 		return err
 	}
 	return nil
@@ -549,4 +605,51 @@ func (vc *VolumeContext) UnmapAt(length uint64, offset uint64) error {
 		}
 	}
 	return nil
+}
+
+func (dc *DeviceContext) SnapshotsSize(vm *VolumeMetadata, sid uint16) uint64 {
+
+	sem, err := GetSnapshotExtentMap(dc, vm.VolumeSize, sid)
+	if err != nil {
+		return 0
+	}
+	var totalSize uint64 = 0
+	sem.extentBitmap.Range(func(x uint32) {
+		e := sem.extents[x]
+		bb := bitmap.FromBytes(e.BlockBitmap[:])
+		totalSize += uint64(bb.Count()) * BLOCK_SIZE
+	})
+
+	return totalSize
+
+}
+
+func (vc *VolumeContext) PrintExtents() error {
+	fmt.Println("---------- Extents for volume  ", toString(vc.volume.VolumeName), "----------")
+	for _, e1 := range vc.vem.extents {
+		if e1.SnapshotId != 0 {
+			fmt.Println(e1)
+		}
+	}
+	fmt.Println("---------------------------------------------------")
+	return nil
+}
+
+func (vc *VolumeContext) NumberOfExtents() int {
+	count := 0
+	for _, e1 := range vc.vem.extents {
+		if e1.SnapshotId != 0 {
+			count++
+		}
+	}
+	return count
+}
+
+func toString(b [256]byte) string {
+	// find first zero byte
+	n := 0
+	for n < len(b) && b[n] != 0 {
+		n++
+	}
+	return string(b[:n])
 }

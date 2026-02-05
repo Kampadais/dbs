@@ -75,3 +75,22 @@ func (file *DirectFile) Close() error {
 	// file.File.Sync()
 	return file.File.Close()
 }
+
+func GetDeviceStats(device string) (*DirectFile, int64, error) {
+	f, err := NewDirectFile(device, os.O_RDWR, 0660)
+	if err != nil {
+		return nil, 0, fmt.Errorf("cannot open %v: %w", device, err)
+	}
+	deviceSize, err := f.Size()
+	if err != nil {
+		return nil, 0, err
+	}
+	if deviceSize == 0 {
+		return nil, 0, fmt.Errorf("device with zero size")
+	}
+	if deviceSize < (100 * (1 << 20)) {
+		return nil, 0, fmt.Errorf("device size less than 100 MB")
+	}
+
+	return f, deviceSize, nil
+}

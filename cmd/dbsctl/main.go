@@ -18,10 +18,13 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/docker/go-units"
-	"github.com/jawher/mow.cli"
+	cli "github.com/jawher/mow.cli"
 	"github.com/jedib0t/go-pretty/v6/table"
 
 	"github.com/Kampadais/dbs"
@@ -45,6 +48,10 @@ func cmdGetDeviceInfo(cmd *cli.Cmd) {
 			{"total_device_extents", di.TotalDeviceExtents},
 			{"allocated_device_extents", di.AllocatedDeviceExtents},
 			{"volume_count", di.VolumeCount},
+			{"has_secondary_device", di.HasSecondaryDevice},
+			{"secondary_device_size", units.HumanSize(float64(di.SecondaryDeviceSize))},
+			{"allocated_secondary_device_extents", di.AllocatedSecondaryDeviceExtents},
+			{"secondary_device_name", di.SecondaryDeviceName},
 		})
 		t.Render()
 	}
@@ -86,17 +93,31 @@ func cmdGetSnapshotInfo(cmd *cli.Cmd) {
 
 		t := table.NewWriter()
 		t.SetOutputMirror(os.Stdout)
-		t.AppendRow(table.Row{"snapshot_id", "parent_snapshot_id", "created_at"})
+		t.AppendRow(table.Row{"snapshot_id", "parent_snapshot_id", "created_at", "size", "labels"})
 		t.AppendSeparator()
 		for i := range si {
 			psid := strconv.Itoa(int(si[i].ParentSnapshotId))
 			if psid == "0" {
 				psid = "-"
 			}
+			var labelStr string
+			if len(si[i].Labels) == 0 {
+				labelStr = "-" // no labels
+			} else {
+				pairs := make([]string, 0, len(si[i].Labels))
+				for k, v := range si[i].Labels {
+					pairs = append(pairs, fmt.Sprintf("%s=%s", k, v))
+				}
+				sort.Strings(pairs) // optional, for stable output
+				labelStr = strings.Join(pairs, ", ")
+			}
+
 			t.AppendRow(table.Row{
 				si[i].SnapshotId,
 				psid,
 				si[i].CreatedAt,
+				si[i].Size,
+				labelStr,
 			})
 		}
 		t.Render()
@@ -104,7 +125,12 @@ func cmdGetSnapshotInfo(cmd *cli.Cmd) {
 }
 
 func cmdInitDevice(cmd *cli.Cmd) {
+	cmd.Spec = "[SECONDARY_DEVICE]"
+	secondaryDevice := cmd.StringArg("SECONDARY_DEVICE", "", "")
+
 	cmd.Action = func() {
+		fmt.Println("Initializing device:", *device, " secondary device:", *secondaryDevice)
+
 		if err := dbs.InitDevice(*device); err != nil {
 			fmt.Println(err)
 		}
@@ -113,7 +139,17 @@ func cmdInitDevice(cmd *cli.Cmd) {
 
 func cmdVacuumDevice(cmd *cli.Cmd) {
 	cmd.Action = func() {
+		fmt.Println("Vacuuming (wiping) device:", *device)
 		if err := dbs.VacuumDevice(*device); err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+func cmdDefragmentDevice(cmd *cli.Cmd) {
+	cmd.Action = func() {
+		fmt.Println("Defragmenting (compacting) device:", *device)
+		if err := dbs.DefragmentDevice(*device); err != nil {
 			fmt.Println(err)
 		}
 	}
@@ -145,9 +181,28 @@ func cmdRenameVolume(cmd *cli.Cmd) {
 }
 
 func cmdCreateSnapshot(cmd *cli.Cmd) {
+	cmd.Spec = "VOLUME_NAME [LABELS...]"
 	volumeName := cmd.StringArg("VOLUME_NAME", "", "")
+	labelArgs := cmd.StringsArg("LABELS", nil, "Labels to attach to the snapshot in key=value format")
+
 	cmd.Action = func() {
-		if err := dbs.CreateSnapshot(*device, *volumeName); err != nil {
+		labels := make(map[string]string)
+
+		// Only parse if user supplied labels
+		if labelArgs != nil {
+			for _, arg := range *labelArgs {
+				parts := strings.SplitN(arg, "=", 2)
+				if len(parts) != 2 {
+					fmt.Printf("invalid label format: %q (expected key=value)\n", arg)
+					os.Exit(1)
+				}
+				key := strings.TrimSpace(parts[0])
+				val := strings.TrimSpace(parts[1])
+				labels[key] = val
+			}
+		}
+
+		if err := dbs.CreateSnapshot(*device, *volumeName, true, time.Now().Format(time.RFC3339), labels); err != nil {
 			fmt.Println(err)
 		}
 	}
@@ -188,7 +243,8 @@ func main() {
 	app.Command("get_volume_info", "", cmdGetVolumeInfo)
 	app.Command("get_snapshot_info", "", cmdGetSnapshotInfo)
 	app.Command("init_device", "", cmdInitDevice)
-	app.Command("vacuum_device", "", cmdVacuumDevice)
+	app.Command("vacuum_device", "Full device cleanup", cmdVacuumDevice)
+	app.Command("defragment_device", "Compact device extents", cmdDefragmentDevice)
 	app.Command("create_volume", "", cmdCreateVolume)
 	app.Command("rename_volume", "", cmdRenameVolume)
 	app.Command("create_snapshot", "", cmdCreateSnapshot)
