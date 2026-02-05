@@ -15,6 +15,8 @@
 package dbs
 
 import (
+	"fmt"
+
 	"github.com/kelindar/bitmap"
 )
 
@@ -126,6 +128,9 @@ func (em *ExtentMap) WriteExtent(eidx uint32, location uint8) error {
 
 // Allocate a new extent into the map.
 func (em *ExtentMap) NewExtentToSnapshot(eidx uint32, snapshotId uint16) error {
+	if uint(em.dc.superblock.AllocatedDeviceExtents) >= em.dc.totalDeviceExtents {
+		return fmt.Errorf("no space left on device")
+	}
 	em.extents[eidx].SnapshotId = snapshotId
 	em.extents[eidx].ExtentPos = em.dc.superblock.AllocatedDeviceExtents
 	em.extents[eidx].DeviceLocation = PRIMARY_DEVICE
@@ -138,6 +143,9 @@ func (em *ExtentMap) NewExtentToSnapshot(eidx uint32, snapshotId uint16) error {
 
 // Copy over all data from an extent to another snapshot and update the map.
 func (em *ExtentMap) CopyExtentToSnapshot(eidx uint32, snapshotId uint16) error {
+	if uint(em.dc.superblock.AllocatedDeviceExtents) >= em.dc.totalDeviceExtents {
+		return fmt.Errorf("no space left on device")
+	}
 	psrc := em.extents[eidx].ExtentPos
 	pdst := em.dc.superblock.AllocatedDeviceExtents
 	if err := em.dc.CopyExtentData(uint(psrc), uint(pdst)); err != nil {
@@ -178,44 +186,57 @@ func (em *ExtentMap) MergeAllInto(emdst *ExtentMap, snapshotId uint16) error {
 		if cbErr != nil {
 			return
 		}
+
 		if emdst.extents[x].SnapshotId != 0 {
+			// Extent already exists in destination snapshot (it was overwritten later).
+			// We must clear it from the current (parent) snapshot on disk.
+			oldPhysPos := em.extents[x].ExtentPos
+			em.extents[x] = ExtentMetadata{}
+			em.extentBitmap.Remove(x)
+
+			empty := ExtentMetadata{}
+			empty.ExtentPos = x // Logical position for the disk record
+			if err := em.dc.WriteExtent(&empty, uint(oldPhysPos), PRIMARY_DEVICE); err != nil {
+				cbErr = err
+			}
 			return
 		}
+
+		// Move to destination snapshot
 		emdst.extents[x] = em.extents[x]
 		emdst.extents[x].SnapshotId = snapshotId
 		emdst.extentBitmap.Set(x)
-		em.extents[x] = ExtentMetadata{}
-		em.extentBitmap.Remove(x)
-		e := em.extents[x]
-		// Convert ExtentPos from position in device to position in volume
-		e.ExtentPos = x
-		if err := em.dc.WriteExtent(&e, uint(em.extents[x].ExtentPos), PRIMARY_DEVICE); err != nil {
+
+		// Persist the move to disk for the destination snapshot
+		if err := emdst.WriteExtent(x, PRIMARY_DEVICE); err != nil {
 			cbErr = err
 			return
 		}
+
+		// Clear from memory for the source snapshot
+		em.extents[x] = ExtentMetadata{}
+		em.extentBitmap.Remove(x)
 	})
-	if cbErr != nil {
-		return cbErr
-	}
-	return nil
+	return cbErr
 }
 
 // Clear all metadata included in the map.
 func (em *ExtentMap) ClearAll() error {
-	var e ExtentMetadata
 	var cbErr error
 	em.extentBitmap.Range(func(x uint32) {
 		if cbErr != nil {
 			return
 		}
-		eidx := em.extents[x].ExtentPos
-		if err := em.dc.WriteExtent(&e, uint(eidx), PRIMARY_DEVICE); err != nil {
+
+		oldPhysPos := em.extents[x].ExtentPos
+		em.extents[x] = ExtentMetadata{}
+		em.extentBitmap.Remove(x)
+
+		empty := ExtentMetadata{}
+		empty.ExtentPos = x // Logical position
+		if err := em.dc.WriteExtent(&empty, uint(oldPhysPos), PRIMARY_DEVICE); err != nil {
 			cbErr = err
-			return
 		}
 	})
-	if cbErr != nil {
-		return cbErr
-	}
-	return nil
+	return cbErr
 }

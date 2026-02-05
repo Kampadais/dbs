@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/docker/go-units"
-	"github.com/jawher/mow.cli"
+	cli "github.com/jawher/mow.cli"
 	"github.com/jedib0t/go-pretty/v6/table"
 
 	"github.com/Kampadais/dbs"
@@ -139,7 +139,17 @@ func cmdInitDevice(cmd *cli.Cmd) {
 
 func cmdVacuumDevice(cmd *cli.Cmd) {
 	cmd.Action = func() {
+		fmt.Println("Vacuuming (wiping) device:", *device)
 		if err := dbs.VacuumDevice(*device); err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+func cmdDefragmentDevice(cmd *cli.Cmd) {
+	cmd.Action = func() {
+		fmt.Println("Defragmenting (compacting) device:", *device)
+		if err := dbs.DefragmentDevice(*device); err != nil {
 			fmt.Println(err)
 		}
 	}
@@ -245,7 +255,8 @@ func main() {
 	app.Command("get_volume_info", "", cmdGetVolumeInfo)
 	app.Command("get_snapshot_info", "", cmdGetSnapshotInfo)
 	app.Command("init_device", "", cmdInitDevice)
-	app.Command("vacuum_device", "", cmdVacuumDevice)
+	app.Command("vacuum_device", "Full device cleanup", cmdVacuumDevice)
+	app.Command("defragment_device", "Compact device extents", cmdDefragmentDevice)
 	app.Command("create_volume", "", cmdCreateVolume)
 	app.Command("rename_volume", "", cmdRenameVolume)
 	app.Command("create_snapshot", "", cmdCreateSnapshot)

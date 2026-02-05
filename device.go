@@ -509,104 +509,89 @@ func (dc *DeviceContext) Defragment() error {
 		return nil
 	}
 
-	var used []defragInfo
-
-	for i := uint(0); i < allocated; i++ {
-		used = append(used, defragInfo{
-			used: false,
-		})
-	}
-
-	vem, err := GetAllExtentMap(dc, dc.superblock.DeviceSize)
-	if err != nil {
-		return err
-	}
-
-	for _, ext := range vem.extents {
-		if ext.SnapshotId != 0 && ext.DeviceLocation == PRIMARY_DEVICE {
-			info := defragInfo{
-				used: true,
-				ext:  ext,
+	used := make(map[uint]ExtentMetadata)
+	eb := make([]ExtentMetadata, EXTENT_BATCH)
+	for offset := uint(0); offset < allocated; offset += EXTENT_BATCH {
+		size := min(allocated-offset, EXTENT_BATCH)
+		if err := dc.ReadExtents(eb[:size], offset); err != nil {
+			return err
+		}
+		for i := uint(0); i < size; i++ {
+			if eb[i].SnapshotId != 0 {
+				used[offset+i] = eb[i]
 			}
-			used[ext.ExtentPos] = info
 		}
 	}
 
+	// Compaction loop
 	for i := uint(0); i < allocated; i++ {
-		if used[i].used {
-			continue
-		}
-	}
-
-	for i := uint(0); i < allocated; i++ {
-		if used[i].used {
+		if _, ok := used[i]; ok {
 			continue
 		}
 
-		//Find a used extent from the end
+		// Hole found at i, find an extent to move from the end
 		var j uint
+		found := false
 		for j = allocated - 1; j > i; j-- {
-			if used[j].used {
+			if _, ok := used[j]; ok {
+				found = true
 				break
 			}
 		}
-		if j <= i {
+
+		if !found {
+			// No more extents to move, we can shrink AllocatedDeviceExtents to i
+			allocated = i
 			break
 		}
 
-		err = MoveExtentData(dc, used[j].ext, i)
-
-		if err != nil {
+		// Move j to i
+		if err := dc.MoveExtentData(used[j], j, i); err != nil {
 			return err
 		}
-		used[i].used = true
-		allocated--
-		used[j].used = false
+		used[i] = used[j]
+		delete(used, j)
 
+		// Shrink allocated boundary if we moved from the current tail
+		if j == allocated-1 {
+			allocated--
+		}
 	}
 
-	return nil
+	// Final shrink of allocated boundary for any existing trailing empty slots
+	for allocated > 0 {
+		if _, ok := used[allocated-1]; ok {
+			break
+		}
+		allocated--
+	}
 
+	dc.superblock.AllocatedDeviceExtents = uint32(allocated)
+	return nil
 }
 
-func MoveExtentData(dc *DeviceContext, ext ExtentMetadata, i uint) error {
-	oldPos := ext.ExtentPos
-	//Read extent data from primary device
+func (dc *DeviceContext) MoveExtentData(ext ExtentMetadata, oldPos uint, newPos uint) error {
+	// Read extent data from primary device
 	abuf := directio.AlignedBlock(EXTENT_SIZE)
-	if _, err := dc.f.ReadAt(abuf, uint64(dc.dataOffset+(uint(ext.ExtentPos)*EXTENT_SIZE))); err != nil {
+	if _, err := dc.f.ReadAt(abuf, uint64(dc.dataOffset+(oldPos*EXTENT_SIZE))); err != nil {
 		return fmt.Errorf("failed to read extent data from primary device: %w", err)
 	}
 
-	ext.ExtentPos = uint32(i)
-
-	//Write extent data to secondary device
-	if _, err := dc.f.WriteAt(abuf, uint64(dc.dataOffset+uint(ext.ExtentPos)*EXTENT_SIZE)); err != nil {
-		return fmt.Errorf("failed to write extent data to secondary device: %w", err)
+	// Write extent data to new physical position
+	if _, err := dc.f.WriteAt(abuf, uint64(dc.dataOffset+(newPos*EXTENT_SIZE))); err != nil {
+		return fmt.Errorf("failed to write extent data: %w", err)
 	}
 
-	err := dc.WriteExtent(&ext, i, PRIMARY_DEVICE)
-	if err != nil {
+	// Write metadata to new physical position
+	// Note: ext already contains the correct logical position in ExtentPos
+	if err := dc.WriteExtent(&ext, newPos, PRIMARY_DEVICE); err != nil {
 		return err
 	}
 
-	extDummy := ExtentMetadata{
-		SnapshotId:     0,
-		ExtentPos:      0,
-		DeviceLocation: 0,
-	}
-	err = dc.WriteExtent(&extDummy, uint(oldPos), PRIMARY_DEVICE)
-	if err != nil {
-		return err
-	}
-	dc.superblock.AllocatedDeviceExtents--
-	err = dc.WriteMetadata()
-	if err != nil {
-		return err
-	}
-	err = dc.WriteSuperblock()
-	if err != nil {
+	// Clear metadata at old physical position
+	extDummy := ExtentMetadata{}
+	if err := dc.WriteExtent(&extDummy, oldPos, 0); err != nil {
 		return err
 	}
 	return nil
-
 }

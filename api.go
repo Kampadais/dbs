@@ -138,7 +138,9 @@ func GetDeviceInfo(device string) (*DeviceInfo, error) {
 		VolumeCount:            dc.CountVolumes(),
 		HasSecondaryDevice:     dc.superblock.HasSecondaryDevice == 1,
 		SecondaryDeviceSize:    dc.superblock.SecondarySize,
-		SecondaryDeviceName:    dc.secondary.Name,
+	}
+	if dc.secondary != nil {
+		di.SecondaryDeviceName = dc.secondary.Name
 	}
 	dc.Close()
 	return di, nil
@@ -234,8 +236,25 @@ func InitDevice(device string, secondary string) error {
 	return dc.Close()
 }
 
+func DefragmentDevice(device string) error {
+	dc, err := GetDeviceContext(device)
+	if err != nil {
+		return err
+	}
+	if err := dc.Defragment(); err != nil {
+		return err
+	}
+	if err := dc.WriteMetadata(); err != nil {
+		return err
+	}
+	if err := dc.WriteSuperblock(); err != nil {
+		return err
+	}
+	return dc.Close()
+}
+
 func VacuumDevice(device string) error {
-	return fmt.Errorf("not implemented")
+	return InitDevice(device, "")
 }
 
 func CreateVolume(device string, volumeName string, volumeSize uint64) error {
