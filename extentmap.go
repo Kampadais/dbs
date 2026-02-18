@@ -92,28 +92,37 @@ func (em *ExtentMap) WriteExtent(eidx uint32) error {
 
 // Allocate a new extent into the map.
 func (em *ExtentMap) NewExtentToSnapshot(eidx uint32, snapshotId uint16) error {
+	pos, err := em.dc.AllocDeviceExtent()
+	if err != nil {
+		return err
+	}
+
 	em.extents[eidx].SnapshotId = snapshotId
-	em.extents[eidx].ExtentPos = em.dc.superblock.AllocatedDeviceExtents
+	em.extents[eidx].ExtentPos = pos
 	if err := em.WriteExtent(eidx); err != nil {
 		return err
 	}
-	em.dc.superblock.AllocatedDeviceExtents++
 	return nil
 }
 
 // Copy over all data from an extent to another snapshot and update the map.
 func (em *ExtentMap) CopyExtentToSnapshot(eidx uint32, snapshotId uint16) error {
 	psrc := em.extents[eidx].ExtentPos
-	pdst := em.dc.superblock.AllocatedDeviceExtents
+
+	pdst, err := em.dc.AllocDeviceExtent()
+	if err != nil {
+		return err
+	}
+
 	if err := em.dc.CopyExtentData(uint(psrc), uint(pdst)); err != nil {
 		return err
 	}
+
 	em.extents[eidx].SnapshotId = snapshotId
 	em.extents[eidx].ExtentPos = pdst
 	if err := em.WriteExtent(eidx); err != nil {
 		return err
 	}
-	em.dc.superblock.AllocatedDeviceExtents++
 	return nil
 }
 
