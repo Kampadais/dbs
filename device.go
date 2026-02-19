@@ -96,7 +96,7 @@ func GetDeviceContext(device string) (*DeviceContext, error) {
 	if err := dc.ReadSuperblock(); err != nil {
 		return nil, err
 	}
-	//markarw ta allocated extents in the bitmap
+	//markarw ta allocated extents sto bitmap
 	for i := uint32(0); i < dc.superblock.AllocatedDeviceExtents; i++ {
 		dc.allocationBitmap.Set(i)
 	}
@@ -333,7 +333,6 @@ func (dc *DeviceContext) AddSnapshot(parentSnapshotId uint16) (uint16, error) {
 
 // evala na desmeuo 256 thn fora mporei na thelei parapanw
 const PREALLOC_BATCH uint32 = 256
-
 
 func (dc *DeviceContext) AllocDeviceExtent() (uint32, error) {
 	dc.allocMu.Lock()
