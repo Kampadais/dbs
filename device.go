@@ -20,9 +20,9 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/kelindar/bitmap"
 	"github.com/ncw/directio"
 )
 
@@ -43,12 +43,10 @@ type DeviceContext struct {
 	extentOffset       uint
 	totalDeviceExtents uint
 	dataOffset         uint
-	allocMu            sync.Mutex
-	allocationBitmap   bitmap.Bitmap
 
-	preallocStart uint32
-	preallocNext  uint32
-	preallocSize  uint32
+	allocMu   sync.Mutex
+	allocNext uint32
+	allocEnd  uint32
 }
 
 // Initialize a new, empty device context.
@@ -80,9 +78,6 @@ func NewDeviceContext(device string) (*DeviceContext, error) {
 	dc.totalDeviceExtents = uint((dc.superblock.DeviceSize - uint64(dc.extentOffset)) / EXTENT_SIZE)
 	metadataSize := dc.extentOffset + uint(dc.totalDeviceExtents*SIZEOF_EXTENT_METADATA)
 	dc.dataOffset = divRoundUp(metadataSize, EXTENT_SIZE) * EXTENT_SIZE
-	//initialize the allocation bitmap
-	dc.allocationBitmap.Grow(uint32(dc.totalDeviceExtents - 1))
-
 	// Account for storage of extent metadata
 	dc.totalDeviceExtents -= (dc.totalDeviceExtents * SIZEOF_EXTENT_METADATA) / EXTENT_SIZE
 	return dc, nil
@@ -96,11 +91,6 @@ func GetDeviceContext(device string) (*DeviceContext, error) {
 	if err := dc.ReadSuperblock(); err != nil {
 		return nil, err
 	}
-	//markarw ta allocated extents sto bitmap
-	for i := uint32(0); i < dc.superblock.AllocatedDeviceExtents; i++ {
-		dc.allocationBitmap.Set(i)
-	}
-
 	if err := dc.ReadMetadata(); err != nil {
 		return nil, err
 	}
@@ -331,62 +321,104 @@ func (dc *DeviceContext) AddSnapshot(parentSnapshotId uint16) (uint16, error) {
 	return uint16(sidx) + 1, nil
 }
 
-// evala na desmeuo 256 thn fora mporei na thelei parapanw
-const PREALLOC_BATCH uint32 = 256
+const PREALLOC_BATCH uint32 = 1024
 
 func (dc *DeviceContext) AllocDeviceExtent() (uint32, error) {
+	for {
+		next := atomic.LoadUint32(&dc.allocNext)
+		end := atomic.LoadUint32(&dc.allocEnd)
+
+		if next < end {
+			if atomic.CompareAndSwapUint32(&dc.allocNext, next, next+1) {
+				return next, nil
+			}
+			continue
+		}
+
+		return dc.refillAndAllocDeviceExtent()
+	}
+}
+
+func (dc *DeviceContext) refillAndAllocDeviceExtent() (uint32, error) {
 	dc.allocMu.Lock()
 	defer dc.allocMu.Unlock()
 
-	if dc.preallocNext >= dc.preallocSize {
-		if err := dc.refillPrealloc(); err != nil {
-			return 0, err
+	for {
+		next := atomic.LoadUint32(&dc.allocNext)
+		end := atomic.LoadUint32(&dc.allocEnd)
+
+		if next >= end {
+			break
+		}
+
+		if atomic.CompareAndSwapUint32(&dc.allocNext, next, next+1) {
+			return next, nil
 		}
 	}
 
-	// next free extent-
-	pos := dc.preallocStart + dc.preallocNext
-	dc.preallocNext++
-
-	return pos, nil
-}
-
-// refillPrealloc: gemisma tis prealloc dexiomenis me nea batch apo extents
-func (dc *DeviceContext) refillPrealloc() error {
-	batch := PREALLOC_BATCH
-
-	// extents checke
-	remaining := uint32(dc.totalDeviceExtents) - dc.superblock.AllocatedDeviceExtents
+	start := dc.superblock.AllocatedDeviceExtents
+	remaining := uint32(dc.totalDeviceExtents) - start
 	if remaining == 0 {
-		return fmt.Errorf("device full: no more extents available")
+		return 0, fmt.Errorf("device full: no more extents available")
 	}
+
+	batch := PREALLOC_BATCH
 	if batch > remaining {
 		batch = remaining
 	}
 
-	dc.preallocStart = dc.superblock.AllocatedDeviceExtents
-	dc.preallocNext = 0
-	dc.preallocSize = batch
-
-	//Superblock update
-	dc.superblock.AllocatedDeviceExtents += batch
+	dc.superblock.AllocatedDeviceExtents = start + batch
 	if err := dc.WriteSuperblock(); err != nil {
-		return fmt.Errorf("failed to update superblock during prealloc: %w", err)
+		dc.superblock.AllocatedDeviceExtents = start
+		return 0, fmt.Errorf("failed to update superblock during extent preallocation: %w", err)
 	}
 
-	// bitmap update
-	for i := uint32(0); i < batch; i++ {
-		dc.allocationBitmap.Set(dc.preallocStart + i)
+	atomic.StoreUint32(&dc.allocNext, start+1)
+	atomic.StoreUint32(&dc.allocEnd, start+batch)
+
+	return start, nil
+}
+
+func (dc *DeviceContext) rollbackUnusedPrealloc() error {
+	dc.allocMu.Lock()
+	defer dc.allocMu.Unlock()
+
+	next := atomic.LoadUint32(&dc.allocNext)
+	end := atomic.LoadUint32(&dc.allocEnd)
+
+	if end == 0 || next >= end {
+		return nil
 	}
+
+	if dc.superblock.AllocatedDeviceExtents != end {
+		return nil
+	}
+
+	dc.superblock.AllocatedDeviceExtents = next
+	if err := dc.WriteSuperblock(); err != nil {
+		dc.superblock.AllocatedDeviceExtents = end
+		return fmt.Errorf("failed to rollback unused preallocated extents: %w", err)
+	}
+
+	atomic.StoreUint32(&dc.allocEnd, next)
 
 	return nil
 }
 
-// Close the device file descriptor.
 func (dc *DeviceContext) Close() error {
+	if err := dc.rollbackUnusedPrealloc(); err != nil {
+		_ = dc.f.Close()
+		return err
+	}
+
 	if err := dc.f.Sync(); err != nil {
+		_ = dc.f.Close()
 		return fmt.Errorf("cannot sync device: %w", err)
 	}
-	dc.f.Close()
+
+	if err := dc.f.Close(); err != nil {
+		return fmt.Errorf("cannot close device: %w", err)
+	}
+
 	return nil
 }

@@ -450,10 +450,6 @@ func (vc *VolumeContext) WriteBlock(data []byte, block uint64, updateMetadata bo
 				return err
 			}
 		}
-		// Update allocation count
-		if err := vc.dc.WriteSuperblock(); err != nil {
-			return err
-		}
 	} else {
 		if !bb.Contains(uint32(bidx)) && !updateMetadata {
 			return ErrMetadataNeedsUpdate

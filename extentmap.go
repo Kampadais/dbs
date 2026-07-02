@@ -102,6 +102,7 @@ func (em *ExtentMap) NewExtentToSnapshot(eidx uint32, snapshotId uint16) error {
 	if err := em.WriteExtent(eidx); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -123,6 +124,7 @@ func (em *ExtentMap) CopyExtentToSnapshot(eidx uint32, snapshotId uint16) error 
 	if err := em.WriteExtent(eidx); err != nil {
 		return err
 	}
+
 	return nil
 }
 
