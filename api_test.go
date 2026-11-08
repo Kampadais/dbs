@@ -34,6 +34,31 @@ const (
 	DEVICE_SIZE = MEGABYTE * 100
 )
 
+func minUint32(a, b uint32) uint32 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func newPreallocTestDevice(c *C, size int64) string {
+	device := fmt.Sprintf("prealloc-%d.img", time.Now().UnixNano())
+
+	f, err := os.OpenFile(device, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0660)
+	c.Assert(err, IsNil)
+
+	err = f.Truncate(size)
+	c.Assert(err, IsNil)
+
+	err = f.Close()
+	c.Assert(err, IsNil)
+
+	err = InitDevice(device)
+	c.Assert(err, IsNil)
+
+	return device
+}
+
 func Test(t *testing.T) {
 	InitDevice(DEVICE)
 	TestingT(t)
@@ -465,4 +490,160 @@ func (s *TestSuite) TestSnapshotIO(c *C) {
 	c.Assert(err, IsNil)
 	err = DeleteVolume(DEVICE, "vol1clone")
 	c.Assert(err, IsNil)
+}
+
+func (s *TestSuite) TestPreallocBatchSequential(c *C) {
+	device := newPreallocTestDevice(c, DEVICE_SIZE)
+	defer os.Remove(device)
+
+	dc, err := GetDeviceContext(device)
+	c.Assert(err, IsNil)
+	defer dc.Close()
+
+	e1, err := dc.AllocDeviceExtent()
+	c.Assert(err, IsNil)
+
+	e2, err := dc.AllocDeviceExtent()
+	c.Assert(err, IsNil)
+
+	e3, err := dc.AllocDeviceExtent()
+	c.Assert(err, IsNil)
+
+	c.Assert(e2, Equals, e1+1)
+	c.Assert(e3, Equals, e2+1)
+}
+
+func (s *TestSuite) TestPreallocUpdatesSuperblockByBatch(c *C) {
+	device := newPreallocTestDevice(c, DEVICE_SIZE)
+	defer os.Remove(device)
+
+	dc, err := GetDeviceContext(device)
+	c.Assert(err, IsNil)
+	defer dc.Close()
+
+	initial := dc.superblock.AllocatedDeviceExtents
+	remaining := uint32(dc.totalDeviceExtents) - initial
+	expectedBatch := minUint32(PREALLOC_BATCH, remaining)
+
+	first, err := dc.AllocDeviceExtent()
+	c.Assert(err, IsNil)
+
+	c.Assert(first, Equals, initial)
+	c.Assert(dc.superblock.AllocatedDeviceExtents, Equals, initial+expectedBatch)
+	c.Assert(dc.allocNext, Equals, initial+1)
+	c.Assert(dc.allocEnd, Equals, initial+expectedBatch)
+}
+
+func (s *TestSuite) TestPreallocReusesBatchWithoutSuperblockUpdate(c *C) {
+	device := newPreallocTestDevice(c, DEVICE_SIZE)
+	defer os.Remove(device)
+
+	dc, err := GetDeviceContext(device)
+	c.Assert(err, IsNil)
+	defer dc.Close()
+
+	_, err = dc.AllocDeviceExtent()
+	c.Assert(err, IsNil)
+
+	afterFirst := dc.superblock.AllocatedDeviceExtents
+
+	_, err = dc.AllocDeviceExtent()
+	c.Assert(err, IsNil)
+
+	c.Assert(dc.superblock.AllocatedDeviceExtents, Equals, afterFirst)
+}
+
+func (s *TestSuite) TestPreallocSecondBatchUpdatesSuperblockAgain(c *C) {
+	device := newPreallocTestDevice(c, DEVICE_SIZE)
+	defer os.Remove(device)
+
+	dc, err := GetDeviceContext(device)
+	c.Assert(err, IsNil)
+	defer dc.Close()
+
+	initial := dc.superblock.AllocatedDeviceExtents
+	remaining := uint32(dc.totalDeviceExtents) - initial
+	firstBatch := minUint32(PREALLOC_BATCH, remaining)
+
+	for i := uint32(0); i < firstBatch; i++ {
+		extent, err := dc.AllocDeviceExtent()
+		c.Assert(err, IsNil)
+		c.Assert(extent, Equals, initial+i)
+	}
+
+	afterFirstBatch := dc.superblock.AllocatedDeviceExtents
+	c.Assert(afterFirstBatch, Equals, initial+firstBatch)
+
+	remaining = uint32(dc.totalDeviceExtents) - afterFirstBatch
+	if remaining == 0 {
+		return
+	}
+
+	secondBatch := minUint32(PREALLOC_BATCH, remaining)
+
+	extent, err := dc.AllocDeviceExtent()
+	c.Assert(err, IsNil)
+
+	c.Assert(extent, Equals, initial+firstBatch)
+	c.Assert(dc.superblock.AllocatedDeviceExtents, Equals, initial+firstBatch+secondBatch)
+}
+
+func (s *TestSuite) TestPreallocRollbackAfterRestart(c *C) {
+	device := newPreallocTestDevice(c, MEGABYTE*600)
+	defer os.Remove(device)
+
+	dc, err := GetDeviceContext(device)
+	c.Assert(err, IsNil)
+
+	first, err := dc.AllocDeviceExtent()
+	c.Assert(err, IsNil)
+
+	err = dc.Close()
+	c.Assert(err, IsNil)
+
+	dc2, err := GetDeviceContext(device)
+	c.Assert(err, IsNil)
+	defer dc2.Close()
+
+	next, err := dc2.AllocDeviceExtent()
+	c.Assert(err, IsNil)
+
+	// Clean Close() rolls back unused reserved extents.
+	// Therefore, after restart, allocation continues at the first unused extent.
+	c.Assert(next, Equals, first+1)
+}
+
+func (s *TestSuite) TestWriteUsesPreallocBatch(c *C) {
+	device := newPreallocTestDevice(c, DEVICE_SIZE)
+	defer os.Remove(device)
+
+	dc, err := GetDeviceContext(device)
+	c.Assert(err, IsNil)
+
+	initial := dc.superblock.AllocatedDeviceExtents
+
+	err = dc.Close()
+	c.Assert(err, IsNil)
+
+	err = CreateVolume(device, "vol1", MEGABYTE*50)
+	c.Assert(err, IsNil)
+
+	vc, err := OpenVolume(device, "vol1")
+	c.Assert(err, IsNil)
+
+	data := make([]byte, BLOCK_SIZE)
+	data[0] = 123
+
+	err = vc.WriteBlock(data, 0, true)
+	c.Assert(err, IsNil)
+
+	err = vc.CloseVolume()
+	c.Assert(err, IsNil)
+
+	info, err := GetDeviceInfo(device)
+	c.Assert(err, IsNil)
+
+	// CloseVolume() closes the underlying device context and rolls back
+	// unused reserved extents, so only the actually used extent remains allocated.
+	c.Assert(info.AllocatedDeviceExtents, Equals, uint(initial+1))
 }

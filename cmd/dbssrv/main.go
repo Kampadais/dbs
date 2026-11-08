@@ -22,7 +22,7 @@ import (
 	"sync"
 
 	nbd "github.com/chazapis/go-nbd/pkg/server"
-	"github.com/jawher/mow.cli"
+	cli "github.com/jawher/mow.cli"
 	"golang.org/x/exp/slices"
 
 	"github.com/Kampadais/dbs"
@@ -50,7 +50,7 @@ func (b *NbdBackend) ReadAt(p []byte, off int64) (n int, err error) {
 func (b *NbdBackend) WriteAt(p []byte, off int64) (n int, err error) {
 	b.Lock()
 	defer b.Unlock()
-	return len(p), b.vc.WriteAt(p, uint64(off))
+	return len(p), b.vc.WriteAt(p, uint64(off), true)
 }
 
 func (b *NbdBackend) Size() (int64, error) {
